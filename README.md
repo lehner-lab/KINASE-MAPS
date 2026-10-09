@@ -1,10 +1,6 @@
 # KINASE-MAPS
 
-Analysis code for the comparative energetic and allosteric maps of five human kinases
-(SRC, FGR, ZAK, JNK2, TSSK2). It reproduces every R figure panel and reported number
-in the manuscript from the processed data in `data/`.
-
-MAPK9 is shown as JNK2 in figures; the data identifier stays MAPK9.
+Analysis code for reproducing the manuscript _Conservation and divergence in the allosteric architectures of five human protein kinases_ (https://www.biorxiv.org/content/10.64898/2026.08.04.742685v1.article-metrics).
 
 ## Data
 
@@ -37,27 +33,6 @@ install.packages(c("data.table", "ggplot2", "ggpubr", "cowplot", "GGally", "ggh4
 cd scripts
 Rscript run_all.R
 ```
-
-Figures go to `results/<Figure>/<Panel>_<description>.pdf` and ChimeraX colouring
-files to `results/00_chimera/`.
-
-| Script | Output |
-|---|---|
-| `001.1_functions` | shared functions and paths |
-| `001.2_datareading` | fitness, ΔΔG and predictions tables |
-| `001.3_ddg_normalization` | cross-kinase ΔΔG normalisation |
-| `01_fitness` | Fig 1G-H, S1A-G |
-| `02_mochiquality` | Fig 1I-J, S2 |
-| `03_stability` | Fig 2 (ChimeraX), S3, S4 |
-| `04_activesite` | Fig 3A, S5B |
-| `05_distance_decay` | Fig 4B, S6A-B |
-| `06_allostery` | Fig 3E-H, 5C, S6C-H, S7 |
-| `07_pockets` | Fig 7A-B, S8B-D, Supplementary Table 4 |
-| `08_anisotropy` | Fig 4E |
-| `09_domain_architecture` | Fig S1I |
-
-Scripts must run in this order. Structure renders (Fig 2, 3, 4, 5, 6, 7, 8) are made
-in ChimeraX from the `.defattr` and `.bild` files.
 
 ## License
 
