@@ -1,6 +1,6 @@
 # KINASE-MAPS
 
-Analysis code for reproducing the manuscript _Conservation and divergence in the allosteric architectures of five human protein kinases_ (https://www.biorxiv.org/content/10.64898/2026.08.04.742685v1.article-metrics).
+Analysis code for reproducing the manuscript _Conservation and divergence in the allosteric architectures of five human protein kinases_ (https://www.biorxiv.org/content/10.64898/2026.08.04.742685v1).
 
 ## Data
 
