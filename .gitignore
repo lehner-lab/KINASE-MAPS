@@ -1,0 +1,19 @@
+# Data (download from Zenodo, see README.md)
+data/
+data.zip
+
+# Pipeline outputs
+results/
+results_before_fresh_run/
+scripts/Rplots.pdf
+scripts/source_variables.RData
+scripts/*.nb.html
+scripts/*.html
+scripts/*_cache/
+scripts/*_files/
+
+# R / editor
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store

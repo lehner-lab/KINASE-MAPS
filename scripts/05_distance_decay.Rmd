@@ -1,0 +1,742 @@
+---
+title: "05 Distance decay"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(scales)
+library(patchwork)
+library(ggpointdensity)
+```
+
+# Setup
+```{r}
+load("source_variables.RData")
+
+output_dir_fig <- paste0(results_path, "Fig4/")
+dir.create(output_dir_fig, showWarnings = FALSE, recursive = TRUE)
+output_dir_figS <- paste0(results_path, "FigS6/")
+dir.create(output_dir_figS, showWarnings = FALSE, recursive = TRUE)
+output_dir_chimera <- paste0(results_path, "00_chimera/")
+```
+
+
+# Read ddG
+
+```{r}
+all_ddg<-fread(paste0(results_newdata,"all_ddg_norm_clean.csv"))
+
+
+all_ddg_a<-all_ddg[assay=="Activity"]
+```
+
+# Per-position ddGa summaries
+
+```{r}
+ddg_mean_a <- all_ddg_a[, .(pos_mean = weighted.mean(`mean_kcal/mol`, `std_kcal.mol`^-2, na.rm = TRUE)),
+                                by = .(Pos, kinase, assay,Pos_al)]
+all_ddg_a <- merge(all_ddg_a, ddg_mean_a,
+                  by = c("Pos", "kinase", "assay","Pos_al"),
+                  all.x = TRUE)
+ddg_median <- all_ddg[, .(pos_median = median(`mean_kcal/mol`, na.rm = TRUE)),
+                                 by = .(Pos, kinase, assay,Pos_al)]
+all_ddg_a <- merge(all_ddg_a, ddg_median,
+                   by = c("Pos", "kinase", "assay","Pos_al"),
+                   all.x = TRUE)
+```
+
+# Distance to the active site
+```{r}
+dist_ATP <- fread(file.path(data_struct, "minimum_residuedistances_ATP.txt"))
+
+anno_dt <- copy(all_ddg_a)
+anno_dt <- as.data.table(anno_dt)
+
+
+ATP_contacts <- unique(anno_dt[
+  ATP == "ATP contact",
+  .(kinase, Pos, Pos_al, ATP)
+])
+
+anno_dt[, Pos := as.numeric(Pos)]
+dist_ATP[, Pos := as.numeric(Pos)]
+
+all_ddg_dist <- merge(anno_dt,dist_ATP, by = c("kinase", "Pos"),all.x=TRUE)
+```
+
+# Contact shells
+
+## Second shell
+
+```{r}
+dist_dt <- fread(paste0(data_struct, "minimum_residuedistances_pairwise.txt"))
+
+dist_dt2 <- copy(dist_dt)
+setnames(dist_dt2, c("Pos1", "Pos2"), c("Pos2", "Pos1"))
+
+
+dist_dt2[, is_atp := Pos1 %in% ATP_contacts[kinase == .BY$kinase, Pos],
+         by = kinase]
+
+dist_dt2[, Pos := fifelse(is_atp, Pos2, Pos1)]
+dist_dt2 <- dist_dt2[is_atp == TRUE]
+
+
+dist_closest <- dist_dt2[
+  , .SD[which.min(scHA_ca)], by = .(kinase, Pos)
+]
+dist_closest_clean<-dist_closest[,.(kinase,Pos,scHA_ca)]
+dist_closest_clean[, is_atp := Pos %in% ATP_contacts[kinase == .BY$kinase, Pos],
+         by = kinase]
+second_shell <- dist_closest_clean[
+  scHA_ca < 5&is_atp==FALSE,
+]
+
+all_ddg_dist[, second_shell := Pos %in% second_shell[kinase == .BY$kinase, Pos], by = kinase]
+```
+
+## Shell assignment
+
+```{r}
+distance_cutoff <- 5
+
+shells <- list()
+shells[[1]] <- unique(ATP_contacts[, .(kinase, Pos)])
+
+repeat {
+  prev_shell <- shells[[length(shells)]]
+
+  close_res <- dist_dt[
+    prev_shell,
+    on = .(kinase, Pos1 = Pos),
+    nomatch = 0
+  ][scHA_ca < distance_cutoff, .(kinase, Pos = Pos2)]
+
+  already <- unique(rbindlist(shells, use.names = TRUE))
+  close_res <- close_res[!already, on = .(kinase, Pos)]
+
+  if (nrow(close_res) == 0) break
+
+  shells[[length(shells) + 1]] <- unique(close_res)
+}
+
+shell_dt <- rbindlist(lapply(seq_along(shells), \(i) {
+  shells[[i]][, shell := i]
+}), use.names = TRUE)
+
+all_ddg_dist[
+  , shell := shell_dt[.SD, on = .(kinase, Pos), x.shell]
+]
+
+
+```
+
+## Shell spacing
+
+```{r shell-spacing}
+shell_dist_ladder <- all_ddg_dist[is.finite(active_site_distance) & !is.na(shell),
+                                  .(mean_dist = mean(active_site_distance)), by = shell]
+setorder(shell_dist_ladder, shell)
+shell_spacing <- mean(diff(shell_dist_ladder$mean_dist))
+print(shell_dist_ladder)
+cat(sprintf("Mean spacing between consecutive shells = %.1f A\n", shell_spacing))
+```
+
+## ChimeraX: shells
+
+```{r}
+shells<-unique(all_ddg_dist[,.(kinase,Pos,shell)])
+for (k in kinases) {
+  sig_residues <- shells[kinase == k]
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: Shells",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$shell)
+  )
+
+  file_name <- paste0(output_dir_chimera, "shells_", k, ".defattr")
+
+
+  writeLines(chimerax_lines, file_name)
+}
+```
+
+
+# Activity classifier
+
+```{r}
+all_ddg_dist[,z_twotailed:=(abs(`mean_kcal/mol`)-0.2)/`std_kcal.mol`]
+all_ddg_dist[,p_twotailed:=1-pnorm(z_twotailed)]
+all_ddg_dist[,fdr_twotailed:=p.adjust(p_twotailed,method = "fdr")]
+
+
+all_ddg_dist[,class:="no change"]
+all_ddg_dist[fdr_twotailed<0.1 & `mean_kcal/mol`< -0.2,class:="activating"]
+all_ddg_dist[fdr_twotailed<0.1 & `mean_kcal/mol`>0.2,class:="inactivating"]
+```
+
+
+# Distance decay
+
+## Absolute ddGa
+```{r}
+all_ddg_dist[,abs_ddg:=abs(`mean_kcal/mol`)]
+all_ddg_dist[, kinase := factor(kinase, levels =kinases)]
+```
+
+## Fit functions
+```{r}
+fit_exponential_curve <- function(xvector, yvector, tit, plotfig = TRUE, color_vector = NULL, point_size = 1.5, anno_y = 2, anno_size = 3.88, anno_gap = NULL, err_vector = NULL) {
+  data <- data.table(x = xvector, y = yvector)
+  if (!is.null(color_vector)) data[, color_group := color_vector]
+  if (!is.null(err_vector))   data[, err := err_vector]
+
+  residual_sum_of_squares <- function(params, x, y) {
+    a <- params[1]
+    b <- params[2]
+    predicted <- a * exp(b * x)
+    sum((y - predicted)^2)
+  }
+
+  initial_guess <- c(a = 2.5, b = -0.1)
+  optimized_params <- optim(initial_guess, residual_sum_of_squares, x = data$x, y = data$y)$par
+
+  fit <- nls(y ~ a * exp(b * x), data = data,
+             start = list(a = optimized_params[1], b = optimized_params[2]))
+
+  data[, predicted := predict(fit, newdata = .SD)]
+  data[, residual := y - predicted]
+
+  plot_obj <- NULL
+  if (plotfig) {
+    x_seq <- seq(min(data$x), max(data$x), length.out = 100)
+    fitted_values <- predict(fit, newdata = data.frame(x = x_seq))
+    parameters <- fit$m$getPars()
+    d_half <- log(2) / abs(unname(parameters[2]))
+    a0_anno    <- bquote("|" * Delta * Delta * "Ga|" [0] == .(round(unname(parameters[1]), 3)))
+    k_anno     <- bquote(k == .(round(unname(parameters[2]), 3)))
+    dhalf_anno <- bquote(d[1/2] == .(round(d_half, 1)) * " Å")
+    if (is.null(anno_gap)) {
+      parameters_anno <- bquote(atop(atop(.(a0_anno), .(k_anno)), .(dhalf_anno)))
+      anno_layer <- annotate("text", x = 25, y = anno_y,
+                             label = paste(deparse(parameters_anno), collapse = ""),
+                             color = "black", parse = TRUE, size = anno_size)
+    } else {
+      anno_layer <- list(
+        annotate("text", x = 25, y = anno_y,                label = paste(deparse(a0_anno),    collapse = ""), color = "black", parse = TRUE, size = anno_size),
+        annotate("text", x = 25, y = anno_y - anno_gap,     label = paste(deparse(k_anno),     collapse = ""), color = "black", parse = TRUE, size = anno_size),
+        annotate("text", x = 25, y = anno_y - 2 * anno_gap, label = paste(deparse(dhalf_anno), collapse = ""), color = "black", parse = TRUE, size = anno_size)
+      )
+    }
+
+  err_layer <- if (!is.null(err_vector)) {
+    geom_linerange(data = data,
+                   aes(x = x, ymin = pmax(0, y - err), ymax = y + err),
+                   color = "grey65", alpha = 0.6, linewidth = 0.3)
+  } else NULL
+
+plot_obj <- ggplot() +
+  err_layer +
+  geom_point(
+    data = data[color_group != "ATP contact"],
+    aes(x = x, y = y),
+    color = alpha("grey40", 0.5),
+    alpha = 0.6, size = point_size
+  ) +
+  geom_point(
+    data = data[color_group == "ATP contact"],
+    aes(x = x, y = y),
+    color = "#ffe500",
+    alpha = 0.4, size = point_size
+  ) +
+  geom_line(
+    data = data.frame(x = x_seq, Fitted = fitted_values),
+    aes(x = x, y = Fitted),
+    color = "black", size = 1
+  ) +
+  anno_layer +
+  labs(x = "Distance to the active site (Å)", y =expression("|"*Delta*Delta*"Ga| (kcal/mol)"), title = tit) +
+  coord_cartesian(ylim = c(0, 2.5), xlim = c(3, 35)) +
+  theme_classic(base_size =13 ) +
+  scale_x_continuous(breaks = seq(5, 35, by = 5)) +
+  theme(legend.position = "none", axis.text = element_text(size = 11.4))
+
+  }
+
+  message(paste("R² =", round(cor(data$predicted, data$y)^2, 3)))
+  return(list(fit = fit, plot = plot_obj, data = data))
+}
+
+fit_exponential_curve_for_kinase <- function(kinase_name,dataused, assay_type = "Activity", ycol = "abs_ddg", plotfig = TRUE, point_size = 1.5, anno_y = 2, anno_size = 3.88, anno_gap = NULL) {
+  subset_data <- dataused[kinase == kinase_name & assay == assay_type]
+
+  if (nrow(subset_data) < 5) {
+    message(paste("Not enough data for kinase:", kinase_name))
+    return(NULL)
+  }
+
+  xvector <- subset_data$active_site_distance
+  yvector <- subset_data[[ycol]]
+  color_vector <- ifelse(subset_data$ATP !="ATP contact",ifelse(subset_data$second_shell==TRUE,"second shell", "no ATP contact"), "ATP contact")
+  tit <- relabel_jnk2(kinase_name)
+  err_vector <- if ("err" %in% names(subset_data)) subset_data$err else NULL
+
+  result <- fit_exponential_curve(xvector, yvector, tit, plotfig, color_vector, point_size, anno_y, anno_size, anno_gap, err_vector = err_vector)
+
+  subset_data[, predicted_y := result$data$predicted]
+  subset_data[, residual := result$data$residual]
+  subset_data[, color_group := color_vector]
+
+  return(list(fit = result$fit, plot = result$plot, data = subset_data))
+}
+
+fit_multiple_kinases <- function(kinases,dataused, assay_type = "Activity", ycol = "abs_ddg", plotfig = TRUE, point_size = 1.5, anno_y = 2, anno_size = 3.88, anno_gap = NULL) {
+  results <- list()
+  plots <- list()
+  pred_data <- list()
+
+  for (k in kinases) {
+    message(paste("Fitting:", k))
+    res <- fit_exponential_curve_for_kinase(k,dataused, assay_type, ycol, plotfig, point_size, anno_y, anno_size, anno_gap)
+    if (!is.null(res)) {
+      results[[k]] <- res$fit
+      plots[[k]] <- res$plot
+      pred_data[[k]] <- res$data
+    }
+  }
+
+  return(list(fits = results, plots = plots, data = pred_data))
+}
+
+```
+
+## All mutations
+```{r}
+all_ddg_dist$kinase<-factor(all_ddg_dist$kinase,levels=kinases,)
+kinase_list <- kinases
+results <- fit_multiple_kinases(kinase_list,all_ddg_dist, ycol = "abs_ddg")
+
+all_predicted_data <- rbindlist(results$data, idcol = "kinase")
+```
+
+## Per-residue median
+```{r}
+per_residue_ddg <- all_ddg_dist[, .(
+  abs_ddg      = median(abs_ddg, na.rm = TRUE),
+  err          = 1.2533 * sd(abs_ddg, na.rm = TRUE) / sqrt(sum(!is.na(abs_ddg))),
+  active_site_distance = active_site_distance[1],
+  ATP          = ATP[1],
+  second_shell = second_shell[1]
+), by = .(Pos, kinase, assay, Pos_al)]
+
+per_residue_ddg[, kinase := factor(kinase, levels = kinases)]
+
+results_median <- fit_multiple_kinases(kinases, per_residue_ddg, ycol = "abs_ddg", point_size = 1, anno_y = 1.2, anno_size = 4.9, anno_gap = 0.12)
+
+results_median$plots <- lapply(results_median$plots, function(p)
+  p + labs(y = expression("Per residue median |"*Delta*Delta*G[a]*"|")))
+p_exp_decay_median <- wrap_plots(results_median$plots, ncol = 5) & coord_cartesian(ylim = c(0, 1.6), xlim = c(3, 35))
+
+ggsave(p_exp_decay_median,
+       filename = paste0(output_dir_figS, "FigS6A_decay_median", format_img),
+       height = 3.5, width = 17, limitsize = FALSE)
+```
+
+# Decay by secondary structure
+
+```{r ss-region-decay}
+ss_data <- rbindlist(results_median$data)
+reg_map <- unique(all_ddg_a[, .(kinase, Pos_al, Region_Name)])
+ss_data <- merge(ss_data, reg_map, by = c("kinase", "Pos_al"), all.x = TRUE)
+ss_data <- ss_data[!is.na(Region_Name) & Region_Name != "" &
+                   is.finite(active_site_distance) & is.finite(abs_ddg)]
+setnames(ss_data, c("abs_ddg", "active_site_distance", "residual"),
+                  c("abs_ddga", "dist_as", "resid"))
+ss_data[, region_class := fcase(grepl("^H", Region_Name), "Helix",
+                                grepl("^B", Region_Name), "Beta strand",
+                                rep(TRUE, .N), "Loop")]
+ss_data[, region_class := factor(region_class, levels = c("Helix", "Beta strand", "Loop"))]
+ss_data[, kinase := factor(kinase, levels = kinases)]
+
+fit_region <- function(d) {
+  if (nrow(d) < 10) return(data.table(a=NA_real_, k=NA_real_, k_se=NA_real_, d_half=NA_real_, r2=NA_real_, n=nrow(d)))
+  fit <- tryCatch(nls(abs_ddga ~ a * exp(b * dist_as), d, start = list(a = 0.5, b = -0.05),
+                      control = nls.control(maxiter = 200, warnOnly = TRUE)), error = function(e) NULL)
+  if (is.null(fit)) return(data.table(a=NA_real_, k=NA_real_, k_se=NA_real_, d_half=NA_real_, r2=NA_real_, n=nrow(d)))
+  co <- coef(fit); se <- tryCatch(summary(fit)$coefficients["b","Std. Error"], error = function(e) NA_real_)
+  data.table(a = co["a"], k = co["b"], k_se = se, d_half = log(2)/abs(co["b"]),
+             r2 = cor(fitted(fit), d$abs_ddga)^2, n = nrow(d))
+}
+region_decay_kin    <- ss_data[, fit_region(.SD), by = .(kinase, region_class)]
+
+add_dhalf_ci <- function(dt) {
+  dt[, ci_lo := log(2) / (abs(k) + 1.96 * k_se)]
+  dt[, ci_hi := log(2) / (abs(k) - 1.96 * k_se)]
+  dt[]
+}
+region_decay_kin    <- add_dhalf_ci(region_decay_kin)
+region_decay_kin[, kinase := factor(kinase, levels = kinases)]
+setorder(region_decay_kin, kinase, region_class)
+cat("== per-kinase decay by secondary structure: d_half with 95% CI (Wald on k) ==\n")
+print(region_decay_kin[region_class %in% c("Beta strand","Helix"),
+      .(kinase, region_class, d_half = round(d_half, 1),
+        CI = sprintf("%.1f-%.1f", ci_lo, ci_hi), r2 = round(r2, 3), n)])
+
+region_decay_compare <- region_decay_kin[region_class %in% c("Beta strand","Helix"), {
+  b <- .SD[region_class == "Beta strand"]; h <- .SD[region_class == "Helix"]
+  z <- (abs(b$k) - abs(h$k)) / sqrt(b$k_se^2 + h$k_se^2)
+  .(dhalf_beta = round(b$d_half, 1), dhalf_helix = round(h$d_half, 1),
+    z = round(z, 2), p_two_sided = signif(2 * pnorm(-abs(z)), 3))
+}, by = kinase]
+setorder(region_decay_compare, kinase)
+cat("\n== beta-strand vs alpha-helix decay constant, z-test (per kinase) ==\n")
+print(region_decay_compare)
+
+region_colors    <- c("Helix" = "tomato", "Beta strand" = "lightblue3", "Loop" = "grey50")
+region_labels_ss <- expression(alpha*"-helix", beta*"-strand", "Loop")
+
+region_curves_kin <- rbindlist(lapply(seq_len(nrow(region_decay_kin)), function(i) {
+  r <- region_decay_kin[i]; if (is.na(r$k)) return(NULL); x <- seq(0, 35, length.out = 100)
+  data.table(kinase = r$kinase, region_class = r$region_class, dist_as = x, fitted = r$a * exp(r$k * x)) }))
+region_curves_kin[, kinase := factor(kinase, levels = kinases)]
+region_curves_kin[, region_class := factor(region_class, levels = levels(ss_data$region_class))]
+
+ann_decay_kin <- copy(region_decay_kin)[!is.na(k)]
+ann_decay_kin[, region_class := factor(region_class, levels = levels(ss_data$region_class))]
+ann_decay_kin[, kinase := factor(kinase, levels = kinases)]
+ann_decay_kin[, y := c("Helix" = 1.80, "Beta strand" = 1.6, "Loop" = 1.4)[as.character(region_class)]]
+ann_decay_kin[, lbl := sprintf('k == %.3f * "," ~ d[1/2] == %.1f ~ "Å"', k, d_half)]
+
+p_region_kin <- ggplot() +
+  geom_point(data = ss_data, aes(dist_as, abs_ddga, color = region_class), alpha = 0.4, size = 0.9) +
+  geom_line(data = region_curves_kin, aes(dist_as, fitted, color = region_class), linewidth = 1.1) +
+  geom_text(data = ann_decay_kin, aes(x = 1, y = y, label = lbl, color = region_class),
+            inherit.aes = FALSE, hjust = 0, size = 5.3, parse = TRUE, show.legend = FALSE) +
+  scale_color_manual(values = region_colors, labels = region_labels_ss) +
+  facet_wrap(~kinase, ncol = 5, labeller = lab_kinase) +
+  coord_cartesian(ylim = c(0, 1.81), xlim = c(0, 35)) +
+  labs(x = "Distance to active site (Å)",
+       y = expression("Per residue median |"*Delta*Delta*G[a]*"|"), color = "Region") +
+  theme_classic(base_size = 12) + theme(strip.text = element_text(face = "bold", size = 13.5), axis.text = element_text(size = 10.6), legend.text = element_text(size = 11.1), legend.title = element_text(size = 13.5))
+ggsave(paste0(output_dir_figS, "FigS6B_decay_by_region", format_img), p_region_kin, width = 15, height = 3.5)
+```
+
+
+# Decay by direction
+
+## Activating mutations
+```{r}
+all_ddg_dist_stab<-all_ddg_dist[`mean_kcal/mol`<0]
+
+all_ddg_dist$kinase<-factor(all_ddg_dist$kinase,levels=kinases)
+kinase_list <- kinases
+results <- fit_multiple_kinases(kinase_list,all_ddg_dist_stab, ycol = "abs_ddg")
+
+stab_all_predicted_data <- rbindlist(results$data)
+```
+## Inactivating mutations
+```{r}
+all_ddg_dist_destab<-all_ddg_dist[`mean_kcal/mol`>0]
+
+all_ddg_dist$kinase<-factor(all_ddg_dist$kinase,levels=kinases)
+kinase_list <- kinases
+results <- fit_multiple_kinases(kinase_list,all_ddg_dist_destab, ycol = "abs_ddg")
+
+destab_all_predicted_data <- rbindlist(results$data)
+```
+## Per-residue median, activating vs inactivating
+```{r}
+fit_exp_nls <- function(dt) {
+  rss <- function(p, x, y) sum((y - p[1] * exp(p[2] * x))^2)
+  opt <- optim(c(a = 1.5, b = -0.05), rss, x = dt$active_site_distance, y = dt$abs_ddg)$par
+  nls(abs_ddg ~ a * exp(b * active_site_distance), data = dt,
+      start = list(a = opt[1], b = opt[2]))
+}
+
+fit_two_directions_for_kinase <- function(kinase_name, data_combined, data_all,
+                                          assay_type = "Activity",
+                                          point_size = 1,
+                                          ylim_val = c(0, 1.6),
+                                          anno_size = 3.88) {
+  act   <- data_combined[kinase == kinase_name & assay == assay_type & direction == "activating"]
+  inact <- data_combined[kinase == kinase_name & assay == assay_type & direction == "inactivating"]
+  all   <- data_all[kinase == kinase_name & assay == assay_type]
+  if (nrow(act) < 5 || nrow(inact) < 5 || nrow(all) < 5) return(NULL)
+
+  fit_act   <- fit_exp_nls(act)
+  fit_inact <- fit_exp_nls(inact)
+  fit_all   <- fit_exp_nls(all)
+
+  x_seq       <- seq(3, 35, length.out = 100)
+  newx        <- data.frame(active_site_distance = x_seq)
+  curve_act   <- data.frame(x = x_seq, y = predict(fit_act,   newdata = newx))
+  curve_inact <- data.frame(x = x_seq, y = predict(fit_inact, newdata = newx))
+  curve_all   <- data.frame(x = x_seq, y = predict(fit_all,   newdata = newx))
+
+  pa  <- coef(fit_act)
+  pi  <- coef(fit_inact)
+  pal <- coef(fit_all)
+
+  dhalf <- function(b) round(log(2) / abs(unname(b)), 1)
+  k_act    <- bquote(k == .(round(unname(pa["b"]),  3)))
+  d_act    <- bquote(d[1/2] == .(dhalf(pa["b"]))  * " Å")
+  k_inact  <- bquote(k == .(round(unname(pi["b"]),  3)))
+  d_inact  <- bquote(d[1/2] == .(dhalf(pi["b"]))  * " Å")
+  anno_all <- bquote(k == .(round(unname(pal["b"]), 3)))
+
+  anno_gap     <- ylim_val[2] * 0.08
+  anno_y_inact <- ylim_val[2] * 0.97
+  anno_y_act   <- ylim_val[2] * 0.72
+
+  err_layers <- if ("err" %in% names(act)) {
+    list(
+      geom_linerange(data = inact,
+                     aes(x = active_site_distance,
+                         ymin = pmax(0, abs_ddg - err),
+                         ymax = abs_ddg + err),
+                     color = "salmon", alpha = 0.5, linewidth = 0.3),
+      geom_linerange(data = act,
+                     aes(x = active_site_distance,
+                         ymin = pmax(0, abs_ddg - err),
+                         ymax = abs_ddg + err),
+                     color = "cornflowerblue", alpha = 0.5, linewidth = 0.3)
+    )
+  } else NULL
+
+  ggplot() +
+    err_layers +
+    geom_point(data = inact, aes(x = active_site_distance, y = abs_ddg), color = "salmon", alpha = 0.7, size = point_size) +
+    geom_point(data = act,   aes(x = active_site_distance, y = abs_ddg), color = "cornflowerblue",  alpha = 0.7, size = point_size) +
+    geom_line(data = curve_act,   aes(x = x, y = y), color = "blue",  linewidth = 1,linetype = "dashed") +
+    geom_line(data = curve_inact, aes(x = x, y = y), color = "red",   linewidth = 1,linetype = "dashed") +
+    annotate("text", x = 25, y = anno_y_act,             label = paste(deparse(k_act),   collapse = ""), color = "blue", parse = TRUE, size = anno_size) +
+    annotate("text", x = 25, y = anno_y_act - anno_gap,  label = paste(deparse(d_act),   collapse = ""), color = "blue", parse = TRUE, size = anno_size) +
+    annotate("text", x = 25, y = anno_y_inact,            label = paste(deparse(k_inact), collapse = ""), color = "red",  parse = TRUE, size = anno_size) +
+    annotate("text", x = 25, y = anno_y_inact - anno_gap, label = paste(deparse(d_inact), collapse = ""), color = "red",  parse = TRUE, size = anno_size) +
+
+    coord_cartesian(ylim = ylim_val, xlim = c(3, 35)) +
+    labs(x = "Distance to the active site (Å)",
+         y = expression("|"*Delta*Delta*G[a]*"| (kcal/mol)"),
+         title = relabel_jnk2(kinase_name)) +
+    scale_x_continuous(breaks = seq(5, 35, by = 5)) +
+    theme_classic(base_size = 13) +
+    theme(legend.position = "none",
+          axis.text  = element_text(size = 10.9))
+}
+
+per_residue_act_split <- all_ddg_dist[`mean_kcal/mol` < 0, .(
+  abs_ddg      = median(abs_ddg, na.rm = TRUE),
+  err          = 1.2533 * sd(abs_ddg, na.rm = TRUE) / sqrt(sum(!is.na(abs_ddg))),
+  active_site_distance = active_site_distance[1],
+  direction    = "activating"
+), by = .(Pos, kinase, assay, Pos_al)]
+
+per_residue_inact_split <- all_ddg_dist[`mean_kcal/mol` > 0, .(
+  abs_ddg      = median(abs_ddg, na.rm = TRUE),
+  err          = 1.2533 * sd(abs_ddg, na.rm = TRUE) / sqrt(sum(!is.na(abs_ddg))),
+  active_site_distance = active_site_distance[1],
+  direction    = "inactivating"
+), by = .(Pos, kinase, assay, Pos_al)]
+
+per_residue_split <- rbind(per_residue_act_split, per_residue_inact_split)
+per_residue_split[, kinase := factor(kinase, levels = kinases)]
+
+plots_split <- lapply(kinases, fit_two_directions_for_kinase,
+                      data_combined = per_residue_split,
+                      data_all      = per_residue_ddg,
+                      anno_size     = 4.8)
+names(plots_split) <- kinases
+plots_split <- lapply(plots_split, function(p)
+  if (is.null(p)) NULL else p + labs(y = expression("Per residue median |"*Delta*Delta*G[a]*"|")))
+
+p_exp_decay_split <- wrap_plots(plots_split, ncol = 5)
+
+ggsave(p_exp_decay_split,
+       filename = paste0(output_dir_fig, "Fig4B_decay_split", format_img),
+       height = 3.5, width = 17, limitsize = FALSE)
+```
+
+## Inhibitory d1/2 with 95% CI
+```{r}
+dhalf_ci <- rbindlist(lapply(kinases, function(k) {
+  dt <- per_residue_inact_split[kinase == k & assay == "Activity" &
+                                is.finite(active_site_distance) & is.finite(abs_ddg)]
+  fit <- tryCatch(fit_exp_nls(dt), error = function(e) NULL)
+  if (is.null(fit)) return(data.table(kinase = k, n_pos = nrow(dt), k = NA_real_,
+                                      d_half = NA_real_, ci_lo = NA_real_, ci_hi = NA_real_, r2 = NA_real_))
+  b  <- unname(coef(fit)["b"])
+  se <- tryCatch(summary(fit)$coefficients["b", "Std. Error"], error = function(e) NA_real_)
+  ci_lo <- if (is.finite(se)) log(2) / (abs(b) + 1.96 * se) else NA_real_
+  ci_hi <- if (is.finite(se)) log(2) / (abs(b) - 1.96 * se) else NA_real_
+  data.table(kinase = k, n_pos = nrow(dt), k = round(b, 4),
+             d_half = round(log(2) / abs(b), 1),
+             ci_lo = round(ci_lo, 1), ci_hi = round(ci_hi, 1),
+             r2 = round(cor(predict(fit), dt$abs_ddg)^2, 3))
+}))
+dhalf_ci[, kinase := factor(kinase, levels = kinases)]
+setorder(dhalf_ci, kinase)
+print(dhalf_ci)
+message(sprintf("Mean inhibitory d1/2 across %d kinases = %.1f A", nrow(dhalf_ci), mean(dhalf_ci$d_half, na.rm = TRUE)))
+cat(sprintf("Variance explained (R2), inhibitory fits: mean %.0f%% (range %.0f%% to %.0f%%)\n",
+            100 * mean(dhalf_ci$r2), 100 * min(dhalf_ci$r2), 100 * max(dhalf_ci$r2)))
+
+dhalf_pooled <- mean(dhalf_ci$d_half, na.rm = TRUE)
+cat(sprintf("Pooled inhibitory d1/2 = %.1f A, shell spacing = %.1f A -> %.1f%% reduction in |ddGa| per shell\n",
+            dhalf_pooled, shell_spacing, 100 * (1 - 2^(-shell_spacing / dhalf_pooled))))
+```
+
+# All mutations, density view
+```{r}
+decay_density_panel <- function(k, ylim_val = c(0, 2.5)) {
+  d <- all_ddg_dist[kinase == k & assay == "Activity" &
+                    is.finite(active_site_distance) & is.finite(abs_ddg)]
+  if (nrow(d) < 5) return(NULL)
+  fit   <- fit_exp_nls(d)
+  p     <- coef(fit)
+  x_seq <- seq(3, 35, length.out = 100)
+  curve <- data.frame(x = x_seq,
+                      y = predict(fit, newdata = data.frame(active_site_distance = x_seq)))
+  d_half     <- log(2) / abs(unname(p["b"]))
+  a0_anno    <- bquote("|"*Delta*Delta*"Ga|"[0] == .(round(unname(p["a"]), 3)))
+  k_anno     <- bquote(k == .(round(unname(p["b"]), 3)))
+  dhalf_anno <- bquote(d[1/2] == .(round(d_half, 1)) * " Å")
+
+  ggplot(d, aes(x = active_site_distance, y = abs_ddg)) +
+    geom_pointdensity(size = 0.4, adjust = 1) +
+    scale_color_gradient(low = "lightgrey", high = "black", name = "Local\ndensity") +
+    geom_line(data = curve, aes(x = x, y = y), color = "black", linewidth = 1, inherit.aes = FALSE) +
+    annotate("text", x = 26, y = ylim_val[2] * 0.94, label = paste(deparse(a0_anno),    collapse = ""), parse = TRUE, size = 4.9) +
+    annotate("text", x = 26, y = ylim_val[2] * 0.86, label = paste(deparse(k_anno),     collapse = ""), parse = TRUE, size = 4.9) +
+    annotate("text", x = 26, y = ylim_val[2] * 0.78, label = paste(deparse(dhalf_anno), collapse = ""), parse = TRUE, size = 4.9) +
+    coord_cartesian(ylim = ylim_val, xlim = c(3, 35)) +
+    scale_x_continuous(breaks = seq(5, 35, by = 5)) +
+    labs(x = "Distance to the active site (Å)",
+         y = expression("|"*Delta*Delta*G[a]*"| (kcal/mol)"),
+         title = relabel_jnk2(k)) +
+    theme_classic(base_size = 13) +
+    theme(legend.position = "none", axis.text = element_text(size = 11.4))
+}
+
+plots_density        <- Filter(Negate(is.null), lapply(kinases, decay_density_panel))
+p_exp_decay_density  <- wrap_plots(plots_density, ncol = 5)
+
+ggsave(p_exp_decay_density,
+       filename = paste0(output_dir_figS, "FigS6A_decay_all_mutations", format_img),
+       height = 3.5, width = 18, limitsize = FALSE)
+```
+
+# ChimeraX
+
+## Median |ddGa|, all mutations
+```{r}
+all_predicted_data <- all_predicted_data[, !duplicated(names(all_predicted_data)), with = FALSE]
+
+all_ddg_dist_median_abs_pos <- all_predicted_data[, .(median_abs_pos = median(abs_ddg, na.rm = TRUE)),by = .(Pos, kinase, assay,Pos_al)]
+
+all_predicted_data<-merge(all_predicted_data,all_ddg_dist_median_abs_pos,by = c("Pos", "kinase", "assay","Pos_al"),
+                  all.x = TRUE)
+unique_kinases <- unique(all_predicted_data$kinase)
+
+all_ddg_dist_chim<-unique(all_predicted_data[,.(kinase,median_abs_pos,Pos)])
+for (k in unique_kinases) {
+  sig_residues <- all_ddg_dist_chim[kinase == k]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: MedianAbsPos",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$median_abs_pos)
+  )
+
+  file_name <- paste0(output_dir_chimera, "median_abs_pos_", k, ".defattr")
+
+  writeLines(chimerax_lines, file_name)
+}
+```
+
+## Median |ddGa|, activating mutations
+
+```{r}
+stab_all_predicted_data <- stab_all_predicted_data[, !duplicated(names(stab_all_predicted_data)), with = FALSE]
+
+stab_all_ddg_dist_median_abs_pos <- stab_all_predicted_data[, .(median_abs_pos = median(abs_ddg, na.rm = TRUE)),
+                                by = .(Pos, kinase, assay,Pos_al)]
+
+stab_all_predicted_data<-merge(stab_all_predicted_data,stab_all_ddg_dist_median_abs_pos,by = c("Pos", "kinase", "assay","Pos_al"),
+                  all.x = TRUE)
+
+unique_kinases <- unique(all_ddg_dist$kinase)
+stab_all_predicted_data<-unique(stab_all_predicted_data[,.(kinase,median_abs_pos,Pos)])
+for (k in unique_kinases) {
+  sig_residues <- stab_all_predicted_data[kinase == k]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: StabMedianAbsPos",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$median_abs_pos)
+  )
+
+  file_name <- paste0(output_dir_chimera, "stab_median_abs_pos_", k, ".defattr")
+
+  writeLines(chimerax_lines, file_name)
+}
+```
+## Median |ddGa|, inactivating mutations
+
+```{r}
+destab_all_predicted_data <- destab_all_predicted_data[, !duplicated(names(destab_all_predicted_data)), with = FALSE]
+
+destab_all_ddg_dist_median_abs_pos <- destab_all_predicted_data[, .(median_abs_pos = median(abs_ddg, na.rm = TRUE)),
+                                by = .(Pos, kinase, assay,Pos_al)]
+
+destab_all_predicted_data<-merge(destab_all_predicted_data,destab_all_ddg_dist_median_abs_pos,by = c("Pos", "kinase", "assay","Pos_al"),
+                  all.x = TRUE)
+
+unique_kinases <- unique(all_ddg_dist$kinase)
+destab_all_predicted_data<-unique(destab_all_predicted_data[,.(kinase,median_abs_pos,Pos)])
+for (k in unique_kinases) {
+  sig_residues <- destab_all_predicted_data[kinase == k]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: DestabMedianAbsPos",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$median_abs_pos)
+  )
+
+  file_name <- paste0(output_dir_chimera, "destab_median_abs_pos_", k, ".defattr")
+
+  writeLines(chimerax_lines, file_name)
+}
+```
+
+
+# Save predicted data
+
+```{r}
+fwrite(all_predicted_data,file=paste0(results_path,"all_predicted_data.csv"))
+```
+
+# ChimeraX: active-site distance (SRC)
+```{r}
+src_dist <- unique(all_ddg_dist[kinase == "SRC", .(Pos, active_site_distance)])
+src_dist <- src_dist[!is.na(active_site_distance)]
+
+chimerax_lines <- c(
+  "attribute: activesitedistance",
+  "recipient: residues",
+  paste0("\t:", src_dist$Pos, "\t", src_dist$active_site_distance)
+)
+
+writeLines(chimerax_lines, paste0(output_dir_chimera, "active_site_distance_SRC.defattr"))
+```
+
+

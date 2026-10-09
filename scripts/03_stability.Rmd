@@ -1,0 +1,970 @@
+---
+title: "03 Stability"
+output: html_notebook
+---
+
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(ggpubr)
+library(scales)
+library(ggridges)
+library(patchwork)
+library(ggrepel)
+
+```
+
+
+# Setup
+
+```{r}
+load("source_variables.RData")
+
+output_dir_figS3<-paste0(results_path,"FigS3/")
+output_dir_figS4<-paste0(results_path,"FigS4/")
+output_dir_chimera<-paste0(results_path,"00_chimera/")
+
+dir.create(output_dir_figS3, showWarnings = FALSE, recursive = TRUE)
+dir.create(output_dir_figS4, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+
+## Shared theme
+
+```{r}
+theme_fig2 <- function(base = 12) {
+  theme_classic(base_size = base) %+replace%
+  theme(
+    axis.text        = element_text(size = 12, color = "black"),
+    axis.title       = element_text(size = 11),
+    strip.text       = element_text(size = 11, face = "bold"),
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 0.7),
+    legend.text      = element_text(size = 9),
+    legend.title     = element_text(size = 10)
+  )
+}
+```
+
+
+# Read ddG
+
+```{r}
+all_ddg<-fread(paste0(results_newdata,"all_ddg_norm.csv"))
+
+all_ddg_f<-all_ddg[assay=="Folding",]
+```
+
+# ddGf distribution
+```{r}
+all_ddg_f$kinase <- factor(all_ddg_f$kinase,levels = rev(kinases))
+
+p_dist_ddg <- ggplot(all_ddg_f, aes(x = ddg_norm, y = kinase)) +
+  geom_density_ridges(alpha = 0.4) +
+  geom_vline(xintercept = 0, color = "gray", linewidth = 0.6, linetype = "dashed") +
+  theme_fig2() +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+    strip.text.x = element_text(size = 10, color = "black", face = "bold")
+  ) +
+  labs(x = expression(Delta*Delta*G[f]), y = "")+
+  xlim(-1,2)+
+  scale_y_discrete(labels = relabel_jnk2)
+
+
+ggsave(p_dist_ddg,filename =paste0(output_dir_figS4,"FigS4A_ddGf_distribution",format_img),height = 4,width = 4)
+```
+
+# Energetic maps
+
+## Folding
+
+```{r}
+weights_dt <- all_ddg_f
+cols <- colorRampPalette(c("blue3", "gray92", "brown3"))(100)
+weights_dt$mut_aa <- factor(weights_dt$mut_aa, levels = all_aa)
+weights_dt$kinase <- factor(weights_dt$kinase, levels = kinases)
+
+cap_val <- max(abs(quantile(weights_dt$ddg_norm, probs = c(0.01, 0.99), na.rm = TRUE)))
+
+all_pos <- sort(unique(weights_dt$Pos_al))
+
+plot_list <- lapply(kinases, function(k) {
+  dt_k    <- weights_dt[kinase == k]
+  wt_map  <- unique(dt_k[, .(Pos_al, WT_AA)])[order(Pos_al)]
+  lab_vec <- wt_map$WT_AA[match(all_pos, wt_map$Pos_al)]
+  lab_vec[is.na(lab_vec)] <- ""
+
+  ggplot(dt_k, aes(x = factor(Pos_al, levels = all_pos), y = mut_aa)) +
+    geom_tile(aes(fill = ddg_norm)) +
+    scale_x_discrete(limits = as.character(all_pos),
+                     labels = lab_vec, drop = FALSE) +
+    scale_fill_gradientn(
+      colours  = cols,
+      values   = scales::rescale(c(-cap_val, 0, cap_val)),
+      guide    = "colorbar",
+      limits   = c(-cap_val, cap_val),
+      oob      = scales::squish,
+      na.value = "grey80"
+    ) +
+    theme_fig2() +
+    labs(x = NULL, y = relabel_jnk2(k), fill = expression(Delta*Delta*G[f])) +
+    theme(
+      axis.text.x  = element_text(size = 10),
+      axis.text.y  = element_text(color = color_axis_y, size = 10),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+      title        = element_text(size = 15),
+      axis.title       = element_text(size = 20),
+      legend.text      = element_text(size = 17),
+      legend.title     = element_text(size = 24)
+
+    )
+})
+
+p <- patchwork::wrap_plots(plot_list, ncol = 1) +
+       patchwork::plot_layout(guides = "collect")
+
+ggsave(p, filename = paste0(output_dir_figS3, "FigS3A_energetic_maps_folding", format_img),
+       height = 15, width = 35, limitsize = FALSE)
+
+```
+
+## Activity
+
+```{r}
+weights_dt <-all_ddg[assay=="Activity",]
+cols <- colorRampPalette(c("blue3", "gray92", "brown3"))(100)
+weights_dt$mut_aa <- factor(weights_dt$mut_aa, levels = all_aa)
+weights_dt$kinase <- factor(weights_dt$kinase, levels = kinases)
+
+cap_val <- max(abs(quantile(weights_dt$ddg_norm, probs = c(0.01, 0.99), na.rm = TRUE)))
+
+all_pos <- sort(unique(weights_dt$Pos_al))
+
+plot_list <- lapply(kinases, function(k) {
+  dt_k    <- weights_dt[kinase == k]
+  wt_map  <- unique(dt_k[, .(Pos_al, WT_AA)])[order(Pos_al)]
+  lab_vec <- wt_map$WT_AA[match(all_pos, wt_map$Pos_al)]
+  lab_vec[is.na(lab_vec)] <- ""
+
+  ggplot(dt_k, aes(x = factor(Pos_al, levels = all_pos), y = mut_aa)) +
+    geom_tile(aes(fill = ddg_norm)) +
+    scale_x_discrete(limits = as.character(all_pos),
+                     labels = lab_vec, drop = FALSE) +
+    scale_fill_gradientn(
+      colours  = cols,
+      values   = scales::rescale(c(-cap_val, 0, cap_val)),
+      guide    = "colorbar",
+      limits   = c(-cap_val, cap_val),
+      oob      = scales::squish,
+      na.value = "grey80"
+    ) +
+    theme_fig2() +
+    labs(x = NULL, y = relabel_jnk2(k), fill = expression(Delta*Delta*G[a])) +
+    theme(
+      axis.text.x  = element_text(size = 10),
+      axis.text.y  = element_text(color = color_axis_y, size = 10),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+      title        = element_text(size = 15),
+      axis.title       = element_text(size = 20),
+      legend.text      = element_text(size = 17),
+      legend.title     = element_text(size = 24)
+    )
+})
+
+p <- patchwork::wrap_plots(plot_list, ncol = 1) +
+       patchwork::plot_layout(guides = "collect")
+
+ggsave(p, filename = paste0(output_dir_figS3, "FigS3B_energetic_maps_activity", format_img),
+       height = 15, width = 35, limitsize = FALSE)
+
+```
+
+# Median ddGf per position
+
+```{r}
+subs_median_dt <- all_ddg_f[, .(median = median(ddg_norm, na.rm = TRUE)),
+                                 by = .(Pos, kinase, assay, Pos_al, WT_AA)]
+
+```
+
+
+```{r}
+dt_region_plot<-all_ddg_f[kinase=="TSSK2"]
+
+cols <- colorRampPalette(c("blue3", "gray92", "brown3"))(100)
+region_colors <- c(
+  B1="lightblue", B2="lightblue", B3="lightblue", B4="lightblue", B5="lightblue",
+  HC="tomato2", HD="tomato2", HE="tomato2", HF="tomato2", HG="tomato2", HH="tomato2", HI="tomato2",
+  AL="lightgreen", CL="yellow2", FL="yellow2"
+)
+
+ddg_median_val <- subs_median_dt$median
+cap_val <- max(abs(quantile(ddg_median_val, probs = c(0.01, 0.99), na.rm = TRUE)))
+
+discrete_ranges <- list(
+  "First"  = as.character(1:127),
+  "Second" = as.character(127:252),
+  "Third"  = as.character(252:378)
+)
+
+get_discrete_breaks <- function(start, end) {
+  as.character(seq(from = start, to = end, by = 10))
+}
+
+subs_median_dt[, pos_group := ifelse(Pos_al <= 127, "First", ifelse(Pos_al <= 252, "Second", "Third"))]
+dt_region_plot[, pos_group := ifelse(Pos_al <= 127, "First", ifelse(Pos_al <= 252, "Second", "Third"))]
+
+region_labels <- dt_region_plot[, .(Pos_al = round(median(as.numeric(Pos_al)))), by = .(Region_Name)]
+region_labels[, kinase := "Region\nLabel"]
+region_labels[, pos_group := ifelse(Pos_al <= 127, "First", ifelse(Pos_al <= 252, "Second", "Third"))]
+
+template_dt <- data.table(Pos_al = 1:378, kinase = "TSSK2")
+src_full <- merge(template_dt, dt_region_plot[kinase == "TSSK2"], by = c("Pos_al", "kinase"), all.x = TRUE)
+src_full[, pos_group := ifelse(Pos_al <= 127, "First", ifelse(Pos_al <= 252, "Second", "Third"))]
+
+
+combined_plots <- list()
+
+range_meta <- list(
+  "First" = c(1, 127), "Second" = c(127, 252), "Third" = c(252, 378)
+)
+
+for (grp in c("First", "Second", "Third")) {
+
+  current_limits <- discrete_ranges[[grp]]
+  current_breaks <- get_discrete_breaks(range_meta[[grp]][1], range_meta[[grp]][2])
+
+  dt_main <- subs_median_dt[pos_group == grp]
+
+  p_main <- ggplot(dt_main) +
+    geom_tile(aes(x = as.factor(Pos_al),
+                  y = factor(kinase, levels = rev(kinases)),
+                  fill = median), color = "white", size = 0.1) +
+
+    geom_text(aes(x = as.factor(Pos_al),
+                  y = kinase,
+                  label = WT_AA), size = 3) +
+
+    scale_fill_gradientn(
+      colours = cols,
+      limits = c(-cap_val, cap_val),
+      oob = scales::squish,
+      na.value = "grey64"
+    ) +
+
+    theme_fig2() +
+    theme(
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "none",
+      axis.text.x = element_blank(),
+      axis.title = element_blank(),
+      strip.text = element_blank()
+    ) +
+
+    scale_x_discrete(
+      expand = c(0, 0),
+      limits = current_limits,
+      breaks = current_breaks
+    ) +
+    scale_y_discrete(labels = relabel_jnk2)
+
+  dt_strip <- src_full[pos_group == grp]
+  labels_strip <- region_labels[pos_group == grp]
+
+  p_strip <- ggplot(dt_strip) +
+    geom_tile(aes(x = as.factor(Pos_al), y = "Region", fill = Region_Name)) +
+
+    geom_text(data = labels_strip,
+              aes(x = as.factor(Pos_al), y = "Region", label = fmt_region(Region_Name)),
+              vjust = 0.5, hjust = 0.5, size = 5, fontface = "bold", parse = TRUE) +
+
+    scale_fill_manual(values = region_colors, na.value = "white") +
+    theme_fig2() +
+    theme(
+      axis.ticks = element_blank(),
+      axis.line.y = element_blank(),
+      legend.position = "none",
+      axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+      strip.text = element_blank(),
+      axis.title = element_blank()
+    ) +
+
+    scale_x_discrete(
+      expand = c(0, 0),
+      limits = current_limits,
+      breaks = current_breaks
+    )
+
+
+  pair <- p_main / p_strip + plot_layout(heights = c(9, 1.5))
+  combined_plots[[grp]] <- wrap_elements(pair)
+}
+
+final_plot <- combined_plots[["First"]] /
+              combined_plots[["Second"]] /
+              combined_plots[["Third"]]
+
+ggsave(
+  plot = final_plot,
+  filename = paste0(output_dir_figS4, "FigS4B_ddGf_median_heatmap", format_img),
+  height = 7,
+  width = 20,
+  limitsize = FALSE
+)
+```
+
+
+# Stabilising and destabilising mutations
+```{r}
+all_ddg_f[, z_stab := ddg_norm / std_kcal_norm]
+all_ddg_f[, p_stab := pnorm(z_stab)]
+all_ddg_f[,fdr_stab:=p.adjust(p_stab,method = "fdr")]
+
+all_ddg_f[, z_destab := ddg_norm / std_kcal_norm]
+all_ddg_f[, p_destab := 1 - pnorm(z_destab)]
+all_ddg_f[,fdr_destab:=p.adjust(p_destab,method = "fdr")]
+
+all_ddg_f[, class := "no change"]
+all_ddg_f[(ddg_norm < -0.2) & fdr_stab < 0.1, class := "stabilizing"]
+all_ddg_f[(ddg_norm > 0.2) & fdr_destab < 0.1, class := "destabilizing"]
+
+
+cat("== Stabilising mutation counts (class == 'stabilizing') ==\n")
+cat("Total stabilising across the 5 kinases: ",
+    all_ddg_f[class == "stabilizing", .N], "\n", sep = "")
+print(all_ddg_f[class == "stabilizing", .N, by = kinase][order(N)])
+```
+
+
+# Region enrichment
+
+```{r}
+feat <- "Region_Name"
+regions_sorted <- c("B1", "B2", "B3", "HC", "B4", "B5", "HD", "HE", "CL", "AL", "HF", "FL", "HG", "HH", "HI")
+
+if ("Region_Name" %in% names(all_ddg_f)) {
+	all_ddg_f[, Region_Name := factor(Region_Name, levels = regions_sorted)]
+}
+
+
+mutation_counts <- all_ddg_f[!is.na(get(feat)), .N, by = .(kinase, class, feature_val = get(feat))]
+mutation_counts <- data.table::dcast(mutation_counts, kinase + feature_val ~ class, value.var = "N", fill = 0)
+mutation_counts_long <- data.table::melt(mutation_counts, id.vars = c("kinase", "feature_val"), variable.name = "class", value.name = "count")
+
+setDT(mutation_counts_long)
+mutation_counts_long[, feature_val := factor(feature_val, levels = regions_sorted)]
+label_dt_base <- mutation_counts_long[, .(total_count = sum(count)), by = .(kinase, feature_val)]
+
+enrichment_list <- list()
+combos <- unique(all_ddg_f[!is.na(get(feat)), .(kinase, feature_val = get(feat))])
+
+for(i in 1:nrow(combos)) {
+	k <- combos$kinase[i]
+	f_val <- combos$feature_val[i]
+	kin_data <- all_ddg_f[kinase == k & !is.na(get(feat))]
+
+	stab_in_feat <- nrow(kin_data[get(feat) == f_val & class == "stabilizing"])
+	non_stab_in_feat <- nrow(kin_data[get(feat) == f_val & class != "stabilizing"])
+	stab_bg <- nrow(kin_data[get(feat) != f_val & class == "stabilizing"])
+	non_stab_bg <- nrow(kin_data[get(feat) != f_val & class != "stabilizing"])
+	res_stab <- fisher.test(matrix(c(stab_in_feat, stab_bg, non_stab_in_feat, non_stab_bg), nrow=2))
+
+	destab_in_feat <- nrow(kin_data[get(feat) == f_val & class == "destabilizing"])
+	non_destab_in_feat <- nrow(kin_data[get(feat) == f_val & class != "destabilizing"])
+	destab_bg <- nrow(kin_data[get(feat) != f_val & class == "destabilizing"])
+	non_destab_bg <- nrow(kin_data[get(feat) != f_val & class != "destabilizing"])
+	res_destab <- fisher.test(matrix(c(destab_in_feat, destab_bg, non_destab_in_feat, non_destab_bg), nrow=2))
+
+	enrichment_list[[i]] <- data.table(
+		kinase = k,
+		feature_val = f_val,
+		p_stab = res_stab$p.value,
+		or_stab = res_stab$estimate,
+		p_destab = res_destab$p.value,
+		or_destab = res_destab$estimate
+	)
+}
+
+enrich_dt <- rbindlist(enrichment_list)
+enrich_dt[, fdr_stab := p.adjust(p_stab, method = "fdr"), by = kinase]
+enrich_dt[, fdr_destab := p.adjust(p_destab, method = "fdr"), by = kinase]
+enrich_dt[, is_stab := fdr_stab < 0.1 & or_stab > 1]
+enrich_dt[, is_destab:= fdr_destab < 0.1 & or_destab > 1]
+
+cat("== Activation-loop (AL) stabilising enrichment across kinases ==\n")
+print(enrich_dt[feature_val == "AL",
+                .(kinase, or_stab = round(or_stab, 2),
+                  p_stab = signif(p_stab, 3), fdr_stab = signif(fdr_stab, 3),
+                  is_stab)][order(match(kinase, kinases))])
+
+stab_hits    <- enrich_dt[is_stab == TRUE]
+region_nkin  <- stab_hits[, .(n_kinases = uniqueN(kinase)), by = feature_val]
+single_hits  <- merge(stab_hits, region_nkin[n_kinases == 1], by = "feature_val")
+cat("\n== Single-kinase stabilising hotspots (region enriched in only one kinase, FDR<0.1 & OR>1) ==\n")
+print(single_hits[order(match(kinase, kinases), -or_stab),
+                     .(kinase, region = feature_val,
+                       or_stab = round(or_stab, 2), fdr_stab = signif(fdr_stab, 3))])
+
+label_dt <- merge(label_dt_base, enrich_dt, by = c("kinase", "feature_val"), all.x = TRUE)
+
+label_dt[is.infinite(or_destab), or_destab := 32]
+label_dt[is.infinite(or_stab), or_stab := 32]
+
+label_dt[, log2_or_destab := log2(or_destab)]
+label_dt[, log2_or_stab := log2(or_stab)]
+
+label_dt[, plot_log2_OR := fcase(
+	or_destab >= or_stab, log2_or_destab,
+	or_stab > or_destab, -log2_or_stab
+)]
+
+label_dt[, enrichment_status := fcase(
+	is_stab == TRUE & is_destab == FALSE, "Stabilizing",
+	is_stab == FALSE & is_destab == TRUE, "Destabilizing",
+	is_stab == TRUE & is_destab == TRUE, "Both",
+	default = "None"
+)]
+
+label_dt[, sig_mark := fcase(
+	is_destab == TRUE | is_stab == TRUE, "*",
+	default = ""
+)]
+
+region_labels <- c(
+	"B1" = "beta*1", "B2" = "beta*2", "B3" = "beta*3", "B4" = "beta*4", "B5" = "beta*5",
+	"HC" = "alpha*'C'", "HD" = "alpha*'D'", "HE" = "alpha*'E'",
+	"HF" = "alpha*'F'", "HG" = "alpha*'G'", "HH" = "alpha*'H'", "HI" = "alpha*'I'",
+	"CL" = "'CL'", "AL" = "'AL'", "FL" = "'FL'"
+)
+
+p_indv_sum <- ggplot(label_dt, aes(x = feature_val, y = factor(kinase, levels = rev(kinases)))) +
+	geom_tile(aes(fill = plot_log2_OR), color = "grey80", linewidth = 0.5) +
+	geom_text(aes(label = sig_mark, color = enrichment_status), size = 8, vjust = 0.75, fontface = "bold", show.legend = FALSE) +
+	scale_fill_gradient2(
+		low = "blue3",
+		mid = "white",
+		high = "brown3",
+		midpoint = 0,
+		name = "Mutation\nenrichment\n(Log2 OR)"
+	) +
+	scale_color_manual(values = c(
+		"Stabilizing" = "white",
+		"Destabilizing" = "brown3",
+		"Both" = "black",
+		"None" = "transparent"
+	)) +
+	scale_x_discrete(labels = function(x) parse(text = region_labels[as.character(x)])) +
+	scale_y_discrete(labels = relabel_jnk2) +
+	theme_fig2() +
+	labs(x = "", y = "") +
+	guides(fill = guide_colorbar(title.position = "left", title.vjust = 0.9)) +
+	theme(
+		legend.position   = "top",
+		legend.direction  = "horizontal",
+		axis.text.x       = element_text(size = 10),
+		axis.text.y       = element_text(size = 10),
+		legend.text       = element_text(size = 7),
+		legend.title      = element_text(size = 8),
+		legend.key.height = unit(0.35, "cm"),
+		legend.key.width  = unit(0.4, "cm")
+	)
+
+```
+
+
+## Region enrichment heatmap
+
+```{r}
+ggsave(
+  plot = p_indv_sum,
+  filename = paste0(output_dir_figS4, "FigS4G_region_enrichment", format_img),
+  height = 2.5,
+  width = 4.5,
+  limitsize = FALSE
+)
+```
+
+
+# Lobes
+
+```{r lobe_destab_proportion, fig.width=5, fig.height=4}
+lobe_dt <- all_ddg_f[lobes %in% c("N-lobe","C-lobe")]
+lobe_dt[, is_destab := !is.na(class) & class == "destabilizing"]
+prop_dt <- lobe_dt[, .(n = .N, n_destab = sum(is_destab)), by = .(kinase, lobes)]
+prop_dt[, frac := n_destab / n][, se := sqrt(frac * (1 - frac) / n)]
+prop_dt[, kinase := factor(kinase, levels = kinases)]
+prop_dt[, lobes := factor(lobes, levels = c("N-lobe","C-lobe"))]
+
+sig_dt <- lobe_dt[, {
+  m <- matrix(c(sum(lobes=="N-lobe" & is_destab), sum(lobes=="N-lobe" & !is_destab),
+                sum(lobes=="C-lobe" & is_destab), sum(lobes=="C-lobe" & !is_destab)),
+              nrow = 2, byrow = TRUE)
+  ft <- fisher.test(m); .(p = ft$p.value, OR_NvsC = unname(ft$estimate))
+}, by = kinase]
+sig_dt[, fdr := p.adjust(p, method = "fdr")]
+sig_dt[, star := fcase(fdr < 0.001, "***", fdr < 0.01, "**", fdr < 0.05, "*", default = "ns")]
+sig_dt <- merge(sig_dt, prop_dt[, .(ymax = max(frac + se)), by = kinase], by = "kinase")
+sig_dt[, kinase := factor(kinase, levels = kinases)]
+
+or_lbl <- merge(prop_dt, sig_dt[, .(kinase, OR_NvsC)], by = "kinase")
+or_lbl[, or_lobe := fifelse(lobes == "N-lobe", OR_NvsC, 1 / OR_NvsC)]
+or_lbl[, or_txt := sprintf("%.1f", or_lobe)]
+or_lbl[, kinase := factor(kinase, levels = kinases)]
+or_lbl[, lobes := factor(lobes, levels = c("N-lobe","C-lobe"))]
+
+cat("== Per-lobe destabilising enrichment OR (lobe vs rest of domain) ==\n")
+print(or_lbl[order(kinase, lobes), .(kinase, lobes, or_lobe = round(or_lobe, 2), or_txt)])
+cat("\n== Fraction of folding variants that are destabilising, per lobe ==\n")
+print(prop_dt[order(kinase, lobes),
+              .(kinase, lobes, n_destab, n, frac = round(frac, 3),
+                pct = round(100 * frac, 1))])
+cat("\n== N-lobe vs C-lobe Fisher test (OR = N vs C) per kinase ==\n")
+print(sig_dt[order(match(kinase, kinases)),
+             .(kinase, OR_NvsC = round(OR_NvsC, 2), p = signif(p, 3),
+               fdr = signif(fdr, 3), star)])
+
+lobe_cols <- c("N-lobe" = "#a46a9d", "C-lobe" = "#d1b4ce")
+p_lobe_prop <- ggplot(prop_dt, aes(x = kinase, y = frac, fill = lobes)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black", linewidth = 0.3) +
+  geom_text(data = or_lbl, aes(x = kinase, y = frac + se + 0.02, label = or_txt, group = lobes),
+            position = position_dodge(width = 0.8), inherit.aes = FALSE, size = 3) +
+  geom_text(data = sig_dt, aes(x = kinase, y = ymax + 0.09, label = star),
+            inherit.aes = FALSE, size = 4) +
+  scale_fill_manual(values = lobe_cols, name = "") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), expand = expansion(mult = c(0, 0.18))) +
+  scale_x_discrete(labels = relabel_jnk2) +
+  theme_fig2() + labs(x = "", y = "Destabilising mutations") +
+  theme(axis.text.x = element_text(size = 10),
+        legend.position = "top")
+ggsave(paste0(output_dir_figS4, "FigS4F_lobe_destabilising", format_img), p_lobe_prop, width = 5.5, height = 3)
+```
+
+# Core vs surface
+
+```{r core_destab_enrichment, fig.width=4, fig.height=3.2}
+combos_c <- unique(all_ddg_f[core_surf %in% c("Core","Surface"), .(kinase, cs = core_surf)])
+enr_core <- rbindlist(lapply(seq_len(nrow(combos_c)), function(i){
+  k <- combos_c$kinase[i]; cv <- combos_c$cs[i]
+  kd <- all_ddg_f[kinase == k & core_surf %in% c("Core","Surface")]
+  d_in  <- nrow(kd[core_surf == cv & class == "destabilizing"])
+  nd_in <- nrow(kd[core_surf == cv & (is.na(class) | class != "destabilizing")])
+  d_bg  <- nrow(kd[core_surf != cv & class == "destabilizing"])
+  nd_bg <- nrow(kd[core_surf != cv & (is.na(class) | class != "destabilizing")])
+  ft  <- fisher.test(matrix(c(d_in, d_bg, nd_in, nd_bg), nrow = 2))
+  ft1 <- fisher.test(matrix(c(d_in, d_bg, nd_in, nd_bg), nrow = 2), alternative = "greater")
+  data.table(kinase = k, core_surf = cv, p_destab = ft$p.value, p_destab_one = ft1$p.value, or_destab = unname(ft$estimate))
+}))
+enr_core[, fdr_destab := p.adjust(p_destab, method = "fdr"), by = kinase]
+enr_core[is.infinite(or_destab), or_destab := 32][or_destab == 0, or_destab := 1/32]
+enr_core[, log2_or := log2(or_destab)]
+enr_core[, sig_mark := fifelse(fdr_destab < 0.1, "*", "")]
+enr_core[, kinase := factor(kinase, levels = kinases)]
+enr_core[, core_surf := factor(core_surf, levels = c("Core","Surface"))]
+
+cat("== Per-kinase enrichment of destabilising, Core vs rest of domain ==\n")
+print(enr_core[core_surf == "Core"][order(or_destab)])
+
+cd <- all_ddg_f[core_surf %in% c("Core","Surface")]
+d_in  <- nrow(cd[core_surf == "Core"    & class == "destabilizing"])
+nd_in <- nrow(cd[core_surf == "Core"    & (is.na(class) | class != "destabilizing")])
+d_bg  <- nrow(cd[core_surf == "Surface" & class == "destabilizing"])
+nd_bg <- nrow(cd[core_surf == "Surface" & (is.na(class) | class != "destabilizing")])
+ft_all_1 <- fisher.test(matrix(c(d_in, d_bg, nd_in, nd_bg), nrow = 2), alternative = "greater")
+ft_all_2 <- fisher.test(matrix(c(d_in, d_bg, nd_in, nd_bg), nrow = 2))
+cat(sprintf("\n== Overall (all 5 kinases): destab core %d/%d , surface %d/%d ==\n",
+            d_in, d_in + nd_in, d_bg, d_bg + nd_bg))
+cat(sprintf("overall OR = %.2f ; one-sided p = %.3e ; two-sided p = %.3e\n",
+            unname(ft_all_1$estimate), ft_all_1$p.value, ft_all_2$p.value))
+
+cat("\n== destabilising mutation count per kinase ==\n")
+print(all_ddg_f[class == "destabilizing", .N, by = kinase][order(N)])
+
+```
+
+## Core vs surface violins
+
+```{r}
+core_or_lab <- enr_core[core_surf == "Core", .(kinase, or_txt = sprintf("Core OR=%.1f\nFET p=%.0e", or_destab, p_destab_one))]
+core_or_lab[, kinase := factor(kinase, levels = kinases)]
+
+p_core_vs_surface_fold <- ggplot(all_ddg_f[core_surf!=""], aes(x = core_surf, y = ddg_norm)) +
+  geom_violin(trim = FALSE,fill="grey80") +
+    geom_boxplot(width = 0.1, alpha = 0.5, color = "black",outlier.size = 0.5) +
+    geom_text(data = core_or_lab, aes(x = 1.5, y = -Inf, label = or_txt),
+              inherit.aes = FALSE, vjust = -0.8, size = 4.0) +
+    labs(title = "",
+         y = expression(Delta*Delta*G[f]~(kcal/mol)),
+         x = "") +
+    theme_fig2() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(size = 11.5, face = "bold"),
+          axis.text.y = element_text(size = 13.5),
+          axis.title  = element_text(size = 12.5),
+          strip.text  = element_text(size = 12.5, face = "bold"))+
+    facet_wrap(~factor(kinase,levels=kinases),ncol=7,nrow=1,labeller = lab_kinase)+
+    stat_compare_means(comparisons = list(
+        c("Core", "Surface")),
+        method.args = list(alternative = "greater"),
+        symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, Inf), symbols = c("****", "***", "**", "*", "ns")),
+                method="wilcox.test", size = 5.4, label.y = 1.7
+    )
+ggsave(p_core_vs_surface_fold,filename =paste0(output_dir_figS4,"FigS4C_core_surface",format_img),height =4,width = 12,limitsize = FALSE)
+```
+
+
+# alphaF burial
+
+```{r}
+hf_stab<-all_ddg_f[Region_Name=="HF"]
+
+if ("rsasa" %in% names(all_ddg_f)) {
+  ss_rsasa <- unique(all_ddg_f[!is.na(rsasa), .(kinase, Pos, Region_Name, rsasa)])
+  ssmean <- ss_rsasa[, .(mean_rsasa = mean(rsasa, na.rm = TRUE)), by = Region_Name][order(mean_rsasa)]
+  cat("== Mean rSASA per secondary-structure element (lowest = most buried) ==\n"); print(head(ssmean, 3))
+}
+cat(sprintf("alpha-F (HF): mean rSASA = %.2f ; median folding effect ddGf = %.2f kcal/mol\n",
+            mean(unique(all_ddg_f[Region_Name=="HF" & !is.na(rsasa), .(kinase,Pos,rsasa)])$rsasa, na.rm=TRUE),
+            median(hf_stab$ddg_norm, na.rm = TRUE)))
+```
+
+
+# ChimeraX: median ddGf
+```{r}
+sig_residues_all<-subs_median_dt[assay=="Folding"]
+unique_kinases <- unique(sig_residues_all$kinase)
+
+for (k in unique_kinases) {
+  sig_residues <- sig_residues_all[kinase == k]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: DDGmedian",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$median)
+  )
+
+
+  file_name <- paste0(output_dir_chimera, "DDGf_median_", k, ".defattr")
+  writeLines(chimerax_lines, file_name)
+}
+```
+
+# Cross-kinase correlation
+```{r}
+region_map <- unique(dt_region_plot[, .(Pos_al, Region_Name)])
+wide_data <- merge(subs_median_dt, region_map, by = "Pos_al", all.x = TRUE)
+
+
+wide_data <- data.table::dcast(wide_data, Pos_al + Region_Name~ factor(kinase,levels=kinases), value.var = "median")
+kinase_cols <- setdiff(names(wide_data), c("Pos_al", "Region_Name"))
+
+pairs <- combn(kinase_cols, 2)
+
+cor_mat_fig2e <- cor(wide_data[, ..kinase_cols], use = "pairwise.complete.obs", method = "pearson")
+cat("== Whole-domain position-median cross-kinase Pearson r matrix ==\n")
+print(round(cor_mat_fig2e, 2))
+cat("Median r across the 10 kinase pairs (position-level): ",
+    sprintf("%.3f", median(cor_mat_fig2e[upper.tri(cor_mat_fig2e)])), "\n", sep = "")
+
+
+plot_list <- list()
+
+for (i in 1:ncol(pairs)) {
+
+  k1 <- pairs[1, i]
+  k2 <- pairs[2, i]
+
+  ct <- suppressWarnings(cor.test(wide_data[[k1]], wide_data[[k2]], method = "pearson"))
+  corr_lab <- paste0(
+    sprintf("R = %.2f", unname(ct$estimate)), ", ",
+    if (ct$p.value < 2.2e-16) "p < 2.2e-16"
+    else paste0("p = ", formatC(ct$p.value, format = "e", digits = 1)))
+
+  p <- ggplot(wide_data, aes(x = .data[[k1]], y = .data[[k2]])) +
+
+    geom_point(alpha = 0.5, size = 1.5) +
+
+    geom_smooth(method = "lm", color="red",se = FALSE, size = 0.5) +
+    geom_vline(xintercept = 0, color = "grey",linetype = "dashed" )+
+    geom_hline(yintercept = 0, color = "grey",linetype = "dashed")+
+
+
+    annotate("text", x = -Inf, y = Inf, label = corr_lab, hjust = -0.05, vjust = 1.6,
+             color = "red", fontface = "bold", size = 4) +
+
+
+    scale_y_continuous(breaks = scales::breaks_width(0.5),
+                       labels = scales::label_number(accuracy = 0.1),
+                       expand = expansion(mult = c(0.05, 0.2))) +
+    scale_x_continuous(breaks = scales::breaks_width(0.5),
+                       labels = scales::label_number(accuracy = 0.1)) +
+
+    theme_fig2() +
+    labs(
+      title = paste(relabel_jnk2(k1), "vs", relabel_jnk2(k2)),
+      x = bquote(.(relabel_jnk2(k1))~"Median"~Delta*Delta*G[f]),
+      y = bquote(.(relabel_jnk2(k2))~"Median"~Delta*Delta*G[f])
+    ) +
+    theme(
+      legend.title = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+
+  plot_list[[paste(k1, k2, sep = "_vs_")]] <- p
+}
+
+p_all_corr<-ggarrange(plotlist=plot_list, ncol = 5,nrow=2,common.legend = T,legend="none")
+
+ggsave(paste0(output_dir_figS4, "FigS4E_pairwise_scatter",format_img),
+	   p_all_corr, width = 12, height = 5)
+```
+
+
+# alphaF dddGf
+
+```{r}
+hf_raw <- all_ddg_f[Region_Name == "HF" & !is.na(ddg_norm)]
+mutation_consensus <- hf_raw[, .(cons_ddG = median(ddg_norm, na.rm = TRUE)), by = .(Pos_al, mut_aa)]
+
+```
+
+
+```{r}
+hf_raw <- merge(hf_raw, mutation_consensus, by = c("Pos_al", "mut_aa"))
+hf_raw[, dddG := ddg_norm - cons_ddG]
+```
+
+
+```{r}
+heatmap_dt <- hf_raw[, .(median_dddG = median(dddG, na.rm = TRUE)), by = .(Pos_al, kinase)]
+
+wt_AA_dt <- unique(all_ddg_f[, .(WT_AA, Pos_al, kinase)])
+heatmap_dt <- merge(heatmap_dt, wt_AA_dt, by = c("kinase", "Pos_al"))
+```
+
+
+## Wilcoxon test and heatmap
+
+```{r}
+sig_dt <- hf_raw[!is.na(dddG), .(
+	pval = if (.N >= 3) wilcox.test(dddG, mu = 0, exact = FALSE)$p.value else NA_real_,
+	N_muts = .N
+), by = .(kinase, Pos_al)]
+
+sig_dt[!is.na(pval), fdr := p.adjust(pval, method = "fdr")]
+sig_dt[, sig_mark := fifelse(!is.na(fdr) & fdr < 0.1, "*", "")]
+
+heatmap_dt <- merge(heatmap_dt, sig_dt[, .(kinase, Pos_al, sig_mark)], by = c("kinase", "Pos_al"), all.x = TRUE)
+
+heatmap_dt[is.na(sig_mark), sig_mark := ""]
+
+heatmap_dt[, plot_label := paste0(WT_AA, sig_mark)]
+
+limit_val <- quantile(abs(heatmap_dt$median_dddG), probs = 0.95, na.rm = TRUE)
+
+p_median_dddG_final <- ggplot(heatmap_dt, aes(x = as.factor(Pos_al), y = factor(kinase, levels = rev(kinases)), fill = median_dddG)) +
+
+	geom_tile(color = "white", linewidth = 0.5) +
+	geom_text(aes(
+		label = plot_label,
+		fontface = ifelse(grepl("\\*", plot_label), "bold", "plain")
+	), size = 4) +
+	scale_fill_gradient2(
+		low = "#00695C",
+		mid = "grey90",
+		high = "#E65100",
+		midpoint = 0,
+		limits = c(-limit_val, limit_val),
+		oob = scales::squish,
+		name = expression(atop("Median", Delta*Delta*Delta*G[f])),
+		na.value = "grey70"
+	) +
+
+	theme_fig2() +
+	scale_y_discrete(labels = relabel_jnk2) +
+	labs(
+		title = expression(Delta*Delta*Delta*G[f]~"in"~alpha*"F"),
+		x = "",
+		y = ""
+	) +
+	theme(
+		panel.grid = element_blank(),
+		axis.text.x = element_text(size = 12, angle = 90, vjust = 0.5),
+		axis.text.y = element_text(size = 12)
+	)
+
+
+ggsave(p_median_dddG_final,filename =paste0(output_dir_figS4,"FigS4J_dddGf_alphaF",format_img),height =2.5,width = 8,limitsize = FALSE)
+
+
+```
+
+## ChimeraX: median dddGf
+
+```{r}
+sig_residues_all<-merge(subs_median_dt[assay=="Folding",.(kinase,Pos_al,Pos)],heatmap_dt,by=c("kinase","Pos_al"))
+unique_kinases <- unique(sig_residues_all$kinase)
+sig_residues_all[,median_dddG:=median_dddG+0.001]
+for (k in unique_kinases) {
+  sig_residues <- sig_residues_all[kinase == k]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: DDDGf",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$median_dddG)
+  )
+
+  file_name <- paste0(output_dir_chimera, "dddGf_median_", k, ".defattr")
+  writeLines(chimerax_lines, file_name)
+}
+```
+
+# Correlation by region
+```{r}
+region_map <- unique(dt_region_plot[, .(Pos_al, Region_Name)])
+dt_cor_input <- merge(subs_median_dt, region_map, by = "Pos_al", all.x = TRUE)
+
+regions_sorted <- c("B1", "B2", "B3", "HC", "B4", "B5", "HD", "HE", "CL", "AL", "HF", "FL", "HG", "HH", "HI")
+
+cor_results_list <- list()
+unique_regions <- unique(dt_cor_input[!is.na(Region_Name)]$Region_Name)
+
+for (reg in unique_regions) {
+
+	dat_reg <- dt_cor_input[Region_Name == reg]
+if (uniqueN(dat_reg$Pos_al) > 2) {
+
+		wide_reg <- data.table::dcast(dat_reg, Pos_al ~ kinase, value.var = "median")
+
+		mat <- cor(wide_reg[, -1, with = FALSE], use = "pairwise.complete.obs", method = "pearson")
+
+		dt_wide <- as.data.table(mat, keep.rownames = "Kinase_1")
+
+		dt_mat <- data.table::melt(
+			dt_wide,
+			id.vars = "Kinase_1",
+			variable.name = "Kinase_2",
+			value.name = "Correlation"
+		)
+
+		dt_mat[, Region_Name := reg]
+
+		cor_results_list[[reg]] <- dt_mat
+	}
+}
+
+final_cor_dt <- rbindlist(cor_results_list)
+
+if(exists("regions_sorted")) {
+	final_cor_dt[, Region_Name := factor(Region_Name, levels = regions_sorted)]
+}
+
+p_cor_heatmap <- ggplot(final_cor_dt[!is.na(Region_Name)], aes(x = factor(Kinase_1,levels=rev(kinases)), y = factor(Kinase_2,levels=rev(kinases)), fill = Correlation)) +
+
+	geom_tile(color = "white") +
+	geom_text(aes(label = round(Correlation, 2)), size = 3, color = "black") +
+	scale_fill_gradient2(low = "grey", mid = "white", high = "red",
+						 midpoint = 0, limit = c(-1, 1), name = "Pearson R") +
+	scale_x_discrete(labels = relabel_jnk2) +
+	scale_y_discrete(labels = relabel_jnk2) +
+	facet_wrap(~Region_Name, ncol = 4, labeller = as_labeller(fmt_region, default = label_parsed)) +
+	theme_fig2() +
+	labs(
+		 x = "", y = "") +
+	theme(
+		axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8),
+		axis.text.y = element_text(size = 8),
+		strip.text = element_text(face = "bold", size = 12),
+		panel.grid = element_blank()
+	)
+
+ggsave(paste0(output_dir_figS4, "FigS4D_region_correlation",format_img),
+	   p_cor_heatmap, width = 8, height = 8)
+
+
+```
+
+## alphaF pairwise
+
+```{r}
+region_map <- unique(dt_region_plot[, .(Pos_al, Region_Name)])
+wide_data <- merge(subs_median_dt, region_map, by = "Pos_al", all.x = TRUE)
+wide_data<-wide_data[Region_Name=="HF"]
+
+wide_data <- data.table::dcast(wide_data, Pos_al + Region_Name ~ factor(kinase, levels=kinases), value.var = "median")
+
+kinase_cols <- setdiff(names(wide_data), c("Pos_al", "Region_Name"))
+
+pairs <- combn(kinase_cols, 2)
+
+
+plot_list <- list()
+
+for (i in 1:ncol(pairs)) {
+
+  k1 <- pairs[1, i]
+  k2 <- pairs[2, i]
+
+  p <- ggplot(wide_data, aes(x = .data[[k1]], y = .data[[k2]])) +
+        geom_vline(xintercept = 0, color = "grey", linetype = "dashed") +
+    geom_hline(yintercept = 0, color = "grey", linetype = "dashed") +
+    geom_abline()+
+
+    geom_point(aes(color = Region_Name), alpha = 0.7, size = 1.5) +
+
+    geom_text_repel(
+      data = wide_data[abs(get(k1) - get(k2)) > 0.5],
+      aes(label = Pos_al),
+      size = 3.5,
+      max.overlaps = Inf,
+      box.padding = 0.35,
+      segment.color = "grey50",
+      seed = 1
+    ) +
+    scale_color_manual(values = region_colors) +
+    theme_fig2() +
+    labs(
+      title = paste(relabel_jnk2(k1), "vs", relabel_jnk2(k2)),
+      x = bquote(.(relabel_jnk2(k1)) ~ "Median" ~ Delta*Delta*G[f]),
+      y = bquote(.(relabel_jnk2(k2)) ~ "Median" ~ Delta*Delta*G[f])
+    ) +
+    theme(
+      legend.title = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )+xlim(-0.5,1.5)+ylim(-0.5,1.5)
+
+  plot_list[[paste(k1, k2, sep = "_vs_")]] <- p
+}
+
+final_grid <- ggarrange(plotlist = plot_list,
+                        ncol =5,
+                        nrow = 2,
+                        common.legend = TRUE,
+                        legend = "none")
+
+ggsave(paste0(output_dir_figS4, "FigS4I_alphaF_pairwise",format_img),
+	   final_grid, width = 12, height = 5)
+
+```
+
+## Median r per region
+
+```{r}
+final_cor_dt_no_own<-final_cor_dt[Kinase_1!=Kinase_2]
+
+final_cor_dt_no_own_clean<-unique(final_cor_dt_no_own[!is.na(Region_Name),.(Region_Name,Correlation)])
+
+cat("== Per-region cross-kinase median Pearson r of position-median ddGf ==\n")
+print(final_cor_dt_no_own_clean[, .(median_r = round(median(Correlation), 2),
+                                     n_pairs = .N),
+                                by = Region_Name][order(-median_r)])
+
+```

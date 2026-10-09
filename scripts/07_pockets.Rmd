@@ -1,0 +1,1504 @@
+---
+title: "07 Pockets"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(ggpubr)
+library(readr)
+library(scales)
+library(gridExtra)
+library(ggridges)
+library(ggnewscale)
+library(patchwork)
+library(ggpattern)
+library(viridis)
+library(bio3d)
+library(stringr)
+library(tidyr)
+```
+
+# Setup
+
+## Paths
+
+```{r}
+load("source_variables.RData")
+output_dir_fig <- paste0(results_path, "Fig7/")
+dir.create(output_dir_fig, showWarnings = FALSE, recursive = TRUE)
+output_dir_figS8 <- paste0(results_path, "FigS8/")
+dir.create(output_dir_figS8, showWarnings = FALSE, recursive = TRUE)
+
+all_ddg<-fread(paste0(results_newdata,"all_ddg_norm.csv"))
+```
+# FTmap (external steps)
+
+## Split structures
+```{r eval=FALSE}
+pdb_folder <- paste0(data_struct,"pdb_files_AF3")
+pdb_folder_result<-paste0(data_struct,"FTmap/split/")
+split_al  <- 113
+
+dt <- as.data.table(unique(all_ddg[,.(kinase, Pos,Pos_al)]))
+
+split_map <- dt[Pos_al == split_al, .(split_res = Pos), by = kinase]
+
+pdb_files <- list.files(pdb_folder, pattern="\\.pdb$", full.names = TRUE)
+pdb_names <- gsub("\\.pdb$", "", basename(pdb_files))
+
+for (i in seq_along(pdb_files)) {
+    pdb_name <- pdb_names[i]
+    pdb_path <- pdb_files[i]
+
+    if (!pdb_name %in% split_map$kinase) {
+        cat("Skipping:", pdb_name, "- no alignment data.\n")
+        next
+    }
+
+    split_res <- split_map[kinase == pdb_name, split_res]
+    cat("\n--- Processing", pdb_name, "Split @ structural pos:", split_res, "\n")
+
+    pdb <- read.pdb(pdb_path)
+
+    atom <- pdb$atom
+   atom$resno <- as.numeric(atom$resno)
+    res_N <- atom$resno[atom$resno <= split_res]
+    res_C <- atom$resno[atom$resno >  split_res]
+
+    pdb_N <- trim.pdb(pdb, resno = res_N)
+    pdb_C <- trim.pdb(pdb, resno = res_C)
+
+    write.pdb(pdb_N, file = file.path(pdb_folder_result, paste0(pdb_name, "_N.pdb")))
+    write.pdb(pdb_C, file = file.path(pdb_folder_result, paste0(pdb_name, "_C.pdb")))
+}
+```
+
+## Separate FTmap clusters
+
+```{r eval=FALSE}
+output_dir <- paste0(data_struct,"FTmap/separated_clusters")
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+extract_structure_data <- function(file_path, suffix, is_n_term = FALSE) {
+  if (!file.exists(file_path)) return(NULL)
+
+  lines <- readLines(file_path, warn = FALSE)
+  header_indices <- grep("^HEADER", lines)
+
+  if (length(header_indices) == 0) return(NULL)
+
+  starts <- header_indices
+  ends <- c(header_indices[-1] - 1, length(lines))
+
+  protein_lines <- c()
+  cluster_list <- list()
+
+  for (i in seq_along(starts)) {
+    chunk <- lines[starts[i]:ends[i]]
+    header_line <- chunk[1]
+
+    if (grepl("HEADER\\s+protein", header_line, ignore.case = TRUE)) {
+      if (is_n_term) {
+        protein_lines <- chunk
+      } else {
+        content_mask <- !grepl("^(HEADER|REMARK)", chunk)
+        protein_lines <- chunk[content_mask]
+      }
+
+    } else if (grepl("crosscluster", header_line)) {
+      cluster_id <- sub(".*crosscluster\\.(\\d+)\\..*", "\\1", header_line)
+
+      new_header <- sub("crosscluster", paste0("crosscluster_", suffix), header_line)
+      chunk[1] <- new_header
+
+      cluster_list[[cluster_id]] <- chunk
+    }
+  }
+
+  return(list(protein = protein_lines, clusters = cluster_list))
+}
+
+write_cluster_files <- function(cluster_list, base_protein, suffix, kinase_name, out_dir) {
+  if (length(cluster_list) == 0) return()
+
+  base_protein_clean <- base_protein[!grepl("\\bATP\\b", base_protein)]
+
+  for (id in names(cluster_list)) {
+    chunk <- cluster_list[[id]]
+
+    header_line <- chunk[1]
+    size_str <- sub(".*\\.(\\d+)\\.pdb.*", "\\1", header_line)
+    cluster_size <- sprintf("%04d", as.numeric(size_str))
+
+    file_content <- c(base_protein_clean, chunk)
+
+    filename <- sprintf("%s_cluster_%s_%s.%s.pdb", kinase_name, suffix, id, cluster_size)
+    full_path <- file.path(out_dir, filename)
+
+    writeLines(file_content, full_path)
+  }
+  cat(sprintf("  -> Generated %d files for %s-term (ATP removed)\n", length(cluster_list), suffix))
+}
+
+
+for (kin in kinases) {
+  cat("\nProcessing Kinase:", kin, "...\n")
+
+  file_n <- paste0(data_struct,"FTmap/predictions/",kin, "_N.pdb")
+  file_c <- paste0(data_struct,"FTmap/predictions/",kin, "_C.pdb")
+  file_full <- paste0(data_struct,"FTmap/predictions/",kin, ".pdb")
+
+  data_n <- extract_structure_data(file_n, "N", is_n_term = TRUE)
+  data_c <- extract_structure_data(file_c, "C", is_n_term = FALSE)
+
+  if (is.null(data_n) && is.null(data_c)) {
+    cat("  [!] Warning: No split files found for", kin, "- Skipping.\n")
+    next
+  }
+
+  base_protein <- c()
+
+  if (file.exists(file_full)) {
+    cat("  -> Using full protein file:", file_full, "\n")
+    base_protein <- readLines(file_full, warn = FALSE)
+  } else {
+    cat("  -> Reconstructing protein from split files.\n")
+    prot_n <- if (!is.null(data_n)) data_n$protein else c()
+    prot_c <- if (!is.null(data_c)) data_c$protein else c()
+    base_protein <- c(prot_n, prot_c)
+  }
+
+  if (!is.null(data_n)) {
+    write_cluster_files(data_n$clusters, base_protein, "N", kin, output_dir)
+  }
+
+  if (!is.null(data_c)) {
+    write_cluster_files(data_c$clusters, base_protein, "C", kin, output_dir)
+  }
+}
+
+
+```
+
+# Pocket contacts
+```{r}
+input_folder <- paste0(data_struct,"FTmap/contacts/")
+
+file_list <- list.files(path = input_folder, pattern = "_cluster_.*_contacts\\.txt$", full.names = TRUE)
+
+raw_dt <- rbindlist(lapply(file_list, function(f) {
+	dt <- fread(f)
+	dt[, filename := basename(f)]
+	return(dt)
+}))
+
+raw_dt[, kinase := str_remove(filename, "_cluster_.*")]
+
+raw_dt[, cluster := str_match(filename, "_cluster_(.*)_contacts\\.txt")[, 2]]
+
+
+raw_dt[, druggability := as.numeric(tstrsplit(cluster, "\\.", keep = 2)[[1]])]
+
+raw_dt[, pocket_id := as.integer(factor(cluster, levels = unique(cluster))), by = kinase]
+
+
+summary_dt <- raw_dt[, .(
+	distance = min(distance)
+), by = .(
+	kinase,
+	cluster,
+	pocket_id,
+	druggability,
+	residue_number = canonical_resno,
+	aminoacid = canonical_res,
+	molecule = noncan_res,
+	mol_chain = noncan_chain,
+	mol_id = noncan_resno
+)]
+
+setnames(summary_dt,"residue_number","Pos")
+```
+
+
+# Pocket analysis
+
+
+## Read data
+
+```{r}
+all_ddg<-fread(paste0(results_newdata,"all_ddg_norm_clean.csv"))
+all_ddg_a<-all_ddg[assay=="Activity"]
+all_ddg_f<-all_ddg[assay=="Folding",]
+
+all_predicted_data<-fread(paste0(results_path,"all_predicted_data.csv"))
+all_predicted_data <- all_predicted_data[, !duplicated(names(all_predicted_data)), with = FALSE]
+
+setDT(all_predicted_data)
+
+allostery_enrichment_dt<-fread(paste0(results_path,"allostery_enrichment_dt.csv"))
+```
+
+## Activity classifier
+
+```{r}
+all_predicted_data[, z_tt   := (abs(`mean_kcal/mol`) - 0.2) / `std_kcal.mol`]
+all_predicted_data[, p_tt   := 1 - pnorm(z_tt)]
+all_predicted_data[, fdr_tt := 1]
+all_predicted_data[active_site == "", fdr_tt := p.adjust(p_tt, method = "fdr")]
+all_predicted_data[, act_class := fcase(
+  fdr_tt < 0.1 & `mean_kcal/mol` < -0.2, "activating",
+  fdr_tt < 0.1 & `mean_kcal/mol` >  0.2, "inactivating",
+  default = "no change")]
+
+all_predicted_data<-merge(all_predicted_data,allostery_enrichment_dt[,.(kinase,Pos_al,enrich_allostery)],all.x = T)
+
+ddg_mean_dt<-unique(all_predicted_data[,.(kinase,Pos_al,Pos,pos_median)])
+pockets_summ<-unique(summary_dt[,.(kinase,Pos,cluster,pocket_id,druggability)])
+pockets<-dplyr::left_join(all_predicted_data,pockets_summ,by=c("kinase","Pos"), relationship = "many-to-many")
+```
+
+## Pocket residues
+```{r}
+setDT(pockets)
+pockets[act_class %in% c("activating", "inactivating") & active_site == "",
+	allosteric := "allosteric"]
+```
+
+
+# Pockets across kinases
+
+```{r}
+individual_pockets<-summary_dt
+ddg_mean_dt<-unique(all_predicted_data[,.(kinase,Pos_al,Pos,pos_median)])
+pockets_summ<-unique(individual_pockets[,.(kinase,Pos,pocket_id,druggability)])
+pockets_summ_al<-merge(ddg_mean_dt,pockets_summ,by=c("kinase","Pos"))
+```
+
+## Aligned pockets
+
+```{r}
+pockets_summ_al[, unique_pocket_id := paste(kinase, pocket_id, sep = "_")]
+
+pocket_residues_list <- split(pockets_summ_al$Pos_al, pockets_summ_al$unique_pocket_id)
+
+all_pockets <- names(pocket_residues_list)
+n <- length(all_pockets)
+```
+
+## Overlap clustering
+
+```{r}
+sim_szym <- matrix(0, nrow = n, ncol = n)
+rownames(sim_szym) <- colnames(sim_szym) <- all_pockets
+
+for (i in 1:n) {
+  residues_i <- pocket_residues_list[[i]]
+  len_i <- length(residues_i)
+
+  for (j in i:n) {
+    residues_j <- pocket_residues_list[[j]]
+    len_j <- length(residues_j)
+
+    inter <- length(intersect(residues_i, residues_j))
+
+    min_len <- min(len_i, len_j)
+
+    score <- if (min_len > 0) inter / min_len else 0
+
+    sim_szym[i, j] <- score
+    sim_szym[j, i] <- score
+  }
+}
+
+
+dist_mat <- as.dist(1 - sim_szym)
+
+hr <- hclust(dist_mat, method = "complete")
+
+cut_height <- 0.6
+
+global_cl <- cutree(hr, h = cut_height)
+
+
+cluster_map <- data.table(
+  unique_pocket_id = names(global_cl),
+  global_pocket_cluster = global_cl
+)
+
+pockets_summ_al[cluster_map, on = "unique_pocket_id", global_pocket_cluster := i.global_pocket_cluster]
+
+min_pos_per_cluster <- pockets_summ_al[!is.na(global_pocket_cluster),
+                                        .(min_Pos_al = min(Pos_al, na.rm = TRUE)),
+                                        by = global_pocket_cluster]
+setorder(min_pos_per_cluster, min_Pos_al)
+min_pos_per_cluster[, new_id := .I]
+id_map <- setNames(min_pos_per_cluster$new_id,
+                   as.character(min_pos_per_cluster$global_pocket_cluster))
+pockets_summ_al[!is.na(global_pocket_cluster),
+                global_pocket_cluster := id_map[as.character(global_pocket_cluster)]]
+
+pockets_summ_al[, global_cluster_size := uniqueN(kinase), by = global_pocket_cluster]
+
+```
+
+## Pocket sizes
+```{r}
+pocket_sizes <- data.table(
+	unique_pocket_id = names(pocket_residues_list),
+	n_residues = lengths(pocket_residues_list)
+)
+
+pockets_summ_al[pocket_sizes, on = "unique_pocket_id", n_residues := i.n_residues]
+```
+
+
+## Druggability per pocket
+```{r}
+max_drug_stats <- pockets_summ_al[, .(
+  max_drug_score = mean(druggability, na.rm = TRUE)
+), by = .(kinase, global_pocket_cluster)]
+
+sum_pockets_summ_ALL<-unique(pockets_summ_al[,.(kinase,Pos_al,global_pocket_cluster)])
+pockets_allkin<-dplyr::left_join(pockets,sum_pockets_summ_ALL,by=c("kinase","Pos_al"), relationship = "many-to-many")
+pockets_allkin<-dplyr::left_join(pockets_allkin,max_drug_stats,by=c("kinase","global_pocket_cluster"))
+
+
+pockets_pos <- pockets_summ_al[!is.na(global_pocket_cluster), .(Pos_al, global_pocket_cluster)]
+
+setnames(pockets_allkin,"global_pocket_cluster","global_pocket_cluster_original")
+setnames(pockets_pos,"global_pocket_cluster","global_pocket_cluster_ALL")
+
+
+pockets_allkin<-dplyr::left_join(pockets_allkin,pockets_pos,by="Pos_al", relationship = "many-to-many")
+setDT(pockets_allkin)
+pockets_allkin[, global_pocket_cluster_ALL := as.integer(as.character(global_pocket_cluster_ALL))]
+pockets_allkin[, is_global_pocket_cluster := !is.na(global_pocket_cluster_original)]
+
+
+pos_pocket<-unique(pockets_allkin[,.(kinase,Pos_al,global_pocket_cluster_ALL)])
+table(pos_pocket$global_pocket_cluster_ALL,pos_pocket$kinase)
+
+
+pockets_allkin[, kinase_cluster_size := uniqueN(Pos_al), by = .(global_pocket_cluster_ALL, kinase)]
+```
+
+
+# Pocket enrichment
+
+## Allosteric
+```{r}
+unique_residues_dt <- unique(pockets_allkin[, .(kinase, Pos_al, allosteric,mut_aa)])
+
+kinase_background <- pockets_allkin[, .(
+  total_residues_kinase = .N,
+  total_sig_kinase = sum(allosteric == "allosteric", na.rm = TRUE)
+), by = kinase]
+
+unique_residues_dt_pocket <- pockets_allkin[,.(kinase, Pos_al, class, global_pocket_cluster_ALL, mut_aa, `mean_kcal/mol`, allosteric,max_drug_score)]
+
+  pocket_stats <- unique_residues_dt_pocket[!is.na(global_pocket_cluster_ALL), .(
+  max_mean_kcal = max(`mean_kcal/mol`, na.rm = TRUE),
+  min_mean_kcal = min(`mean_kcal/mol`, na.rm = TRUE),
+  median_mean_kcal = median(`mean_kcal/mol`, na.rm = TRUE),
+
+  druggability_score = max(max_drug_score, na.rm = TRUE),
+
+  pocket_size = .N,
+  pocket_sig_count = sum(allosteric == "allosteric", na.rm = TRUE)
+
+
+), by = .(kinase, global_pocket_cluster_ALL)]
+
+final_summary <- merge(pocket_stats, kinase_background, by = "kinase", all.x = TRUE)
+
+final_summary[, enrichment_pval := phyper(
+  q = pocket_sig_count - 1,
+  m = total_sig_kinase,
+  n = total_residues_kinase - total_sig_kinase,
+  k = pocket_size,
+  lower.tail = FALSE
+)]
+
+final_summary[, enrichment_padj := p.adjust(enrichment_pval, method = "fdr")]
+
+
+```
+
+
+## Allosteric enrichment test
+
+```{r}
+final_summary[, a := pocket_sig_count]
+final_summary[, b := pocket_size - pocket_sig_count]
+final_summary[, c := total_sig_kinase - pocket_sig_count]
+final_summary[, d := (total_residues_kinase - total_sig_kinase) - b]
+
+final_summary[, odds_ratio := (a * d) / (b * c)]
+
+final_summary[, log2_or := log2(odds_ratio)]
+
+final_summary[, c("a", "b", "c", "d") := NULL]
+
+final_summary_allostery <- final_summary[, .(
+  kinase,
+  global_pocket_cluster_ALL,
+  max_mean_kcal = round(max_mean_kcal, 2),
+  min_mean_kcal = round(min_mean_kcal, 2),
+  median_mean_kcal = round(median_mean_kcal, 2),
+  druggability_score,
+  pocket_size,
+  pocket_sig_count,
+  total_sig_kinase,
+  enrichment_pval,
+  enrichment_padj,
+  is_enriched = enrichment_padj < 0.1,
+  odds_ratio,
+  log2_or
+)]
+
+setorder(final_summary_allostery, enrichment_pval)
+
+```
+## Activating and inactivating (active site included)
+
+```{r}
+unique_residues_dt <- unique(pockets_allkin[, .(kinase, Pos_al,class,mut_aa)])
+
+kinase_background <- unique_residues_dt[, .(
+  total_residues_kinase = .N,
+  total_activating_kinase = sum(class == "activating", na.rm = TRUE),
+  total_inactivating_kinase = sum(class == "inactivating", na.rm = TRUE)
+), by = kinase]
+
+unique_residues_dt_pocket <- unique(pockets_allkin[, .(kinase, Pos_al,class,global_pocket_cluster_ALL,mut_aa)])
+
+pocket_stats <- unique_residues_dt_pocket[, .(
+  pocket_size = .N,
+
+  pocket_activating_count = sum(class == "activating", na.rm = TRUE),
+  pocket_inactivating_count = sum(class == "inactivating", na.rm = TRUE)
+
+), by = .(kinase, global_pocket_cluster_ALL)]
+
+final_summary <- merge(pocket_stats, kinase_background, by = "kinase", all.x = TRUE)
+```
+
+## Activating and inactivating tests
+
+```{r}
+final_summary[, enrich_act_pval := phyper(
+  q = pocket_activating_count - 1,
+  m = total_activating_kinase,
+  n = total_residues_kinase - total_activating_kinase,
+  k = pocket_size,
+  lower.tail = FALSE
+)]
+
+final_summary[, c("a", "b", "c", "d") := .(
+  pocket_activating_count,
+  pocket_size - pocket_activating_count,
+  total_activating_kinase - pocket_activating_count,
+  (total_residues_kinase - total_activating_kinase) - (pocket_size - pocket_activating_count)
+)]
+final_summary[, log2_or_act := log2((a * d) / (b * c))]
+
+
+final_summary[, enrich_inact_pval := phyper(
+  q = pocket_inactivating_count - 1,
+  m = total_inactivating_kinase,
+  n = total_residues_kinase - total_inactivating_kinase,
+  k = pocket_size,
+  lower.tail = FALSE
+)]
+
+final_summary[, c("a", "b", "c", "d") := .(
+  pocket_inactivating_count,
+  pocket_size - pocket_inactivating_count,
+  total_inactivating_kinase - pocket_inactivating_count,
+  (total_residues_kinase - total_inactivating_kinase) - (pocket_size - pocket_inactivating_count)
+)]
+final_summary[, log2_or_inact := log2((a * d) / (b * c))]
+
+final_summary[, c("a", "b", "c", "d") := NULL]
+
+final_summary[, enrichment_act_padj := p.adjust(enrich_act_pval, method = "fdr")]
+final_summary[, is_activating_hotspot := enrichment_act_padj < 0.1]
+final_summary[, enrichment_inact_padj := p.adjust(enrich_inact_pval, method = "fdr")]
+final_summary[, is_inactivating_hotspot := enrichment_inact_padj < 0.1]
+
+cols_to_round <- c("log2_or_act", "log2_or_inact")
+final_summary[, (cols_to_round) := lapply(.SD, round, 2), .SDcols = cols_to_round]
+
+setorder(final_summary, enrich_act_pval, enrich_inact_pval)
+
+final_dt_pockets_plot<-merge(final_summary_allostery,final_summary, by=c("kinase","global_pocket_cluster_ALL"))
+if ("pocket_size.x" %in% names(final_dt_pockets_plot)) {
+  setnames(final_dt_pockets_plot, "pocket_size.x", "pocket_size")
+  final_dt_pockets_plot[, pocket_size.y := NULL]
+}
+long_counts <- pos_pocket[, .(n_residues = .N), by = .(global_pocket_cluster_ALL, kinase)]
+final_dt_pockets_plot<-merge(final_dt_pockets_plot,long_counts)
+
+```
+
+# Fig 7A panels
+
+## Median effect
+
+```{r}
+final_dt_pockets_plot[, global_pocket_cluster_ALL := factor(global_pocket_cluster_ALL, levels = sort(unique(as.numeric(as.character(global_pocket_cluster_ALL)))))]
+
+global_max<-max(final_dt_pockets_plot$median_mean_kcal)
+global_min<-min(final_dt_pockets_plot$median_mean_kcal)
+
+final_dt_pockets_plot[,pocket_name:=paste0("Pocket ",global_pocket_cluster_ALL)]
+
+p1_energy <- ggplot(final_dt_pockets_plot, aes(x = factor(global_pocket_cluster_ALL), y = factor(kinase,levels=rev(kinases)), fill = median_mean_kcal)) +
+    geom_tile(color = "white") +
+	geom_tile(
+		data = final_dt_pockets_plot[n_residues < 4],
+		fill = "grey40",alpha=0.6
+	) +
+    scale_fill_gradientn(
+      colours = c("blue3", "grey90", "brown3"),
+      values = rescale(c(-1, 0, 1)),
+      limits = c(-1, 1),
+      guide = "colorbar"
+    )+
+  labs(fill=expression("Median "*Delta*Delta*G[a]))+
+    theme_minimal() +
+    theme(axis.title.x = element_blank(),
+          panel.grid = element_blank(),
+          legend.position = "right",
+          legend.title = element_text(size = 8,angle = 90),
+          legend.title.position = "left",
+          legend.text = element_text(size = 6),
+          legend.key.size = unit(0.3, "cm"),
+          axis.text.x = element_blank(),
+          plot.title =element_text(size = 10))+
+    labs(y="")+
+    scale_y_discrete(labels = relabel_jnk2)
+```
+## Cap log2 OR: allosteric
+```{r}
+finite_vals <- final_dt_pockets_plot$log2_or[is.finite(final_dt_pockets_plot$log2_or)]
+limit_val <- if(length(finite_vals) > 0) max(abs(finite_vals), na.rm = TRUE) else 1
+if(limit_val == 0) limit_val <- 1
+
+
+final_dt_pockets_plot[log2_or == Inf, log2_or := limit_val]
+final_dt_pockets_plot[log2_or == -Inf, log2_or := -limit_val]
+```
+
+## Cap log2 OR: activating
+```{r}
+finite_vals <- final_dt_pockets_plot$log2_or_act[is.finite(final_dt_pockets_plot$log2_or_act)]
+limit_val <- if(length(finite_vals) > 0) max(abs(finite_vals), na.rm = TRUE) else 1
+if(limit_val == 0) limit_val <- 1
+
+
+final_dt_pockets_plot[log2_or_act == Inf, log2_or_act := limit_val]
+final_dt_pockets_plot[log2_or_act == -Inf, log2_or_act := -limit_val]
+```
+
+## Allosteric activating
+
+```{r}
+flag_allo_dir <- function(dt) {
+  dt[, allo_activating   := !is.na(allosteric) & allosteric == "allosteric" & `mean_kcal/mol` < 0]
+  dt[, allo_inactivating := !is.na(allosteric) & allosteric == "allosteric" & `mean_kcal/mol` > 0]
+  dt[]
+}
+
+bg_mut <- unique(pockets_allkin[, .(kinase, Pos_al, mut_aa, allosteric, `mean_kcal/mol`)])
+flag_allo_dir(bg_mut)
+kinase_background_allo <- bg_mut[, .(
+  total_residues_kinase       = .N,
+  total_allo_activating_kin   = sum(allo_activating),
+  total_allo_inactivating_kin = sum(allo_inactivating)
+), by = kinase]
+
+pk_mut <- unique(pockets_allkin[!is.na(global_pocket_cluster_ALL),
+  .(kinase, Pos_al, mut_aa, global_pocket_cluster_ALL, allosteric, `mean_kcal/mol`)])
+flag_allo_dir(pk_mut)
+pocket_stats_allo <- pk_mut[, .(
+  pocket_size                    = .N,
+  pocket_allo_activating_count   = sum(allo_activating),
+  pocket_allo_inactivating_count = sum(allo_inactivating)
+), by = .(kinase, global_pocket_cluster_ALL)]
+
+final_summary_allo <- merge(pocket_stats_allo, kinase_background_allo, by = "kinase", all.x = TRUE)
+
+final_summary_allo[, enrich_act_pval := phyper(
+  q = pocket_allo_activating_count - 1,
+  m = total_allo_activating_kin,
+  n = total_residues_kinase - total_allo_activating_kin,
+  k = pocket_size,
+  lower.tail = FALSE)]
+final_summary_allo[, c("a","b","c","d") := .(
+  pocket_allo_activating_count,
+  pocket_size - pocket_allo_activating_count,
+  total_allo_activating_kin - pocket_allo_activating_count,
+  (total_residues_kinase - total_allo_activating_kin) - (pocket_size - pocket_allo_activating_count))]
+final_summary_allo[, log2_or_act_allo := log2((a * d) / (b * c))]
+final_summary_allo[, OR_act_allo := (a * d) / (b * c)]
+final_summary_allo[, c("a","b","c","d") := NULL]
+final_summary_allo[, FDR_act_allo := p.adjust(enrich_act_pval, method = "fdr")]
+final_summary_allo[, is_activating_hotspot_allo := FDR_act_allo < 0.1]
+
+final_summary_allo[, gp_key := as.character(global_pocket_cluster_ALL)]
+final_dt_pockets_plot[, gp_key := as.character(global_pocket_cluster_ALL)]
+final_dt_pockets_plot[final_summary_allo, on = c("kinase","gp_key"),
+  `:=`(log2_or_act_allo           = i.log2_or_act_allo,
+       OR_act_allo                = i.OR_act_allo,
+       FDR_act_allo               = i.FDR_act_allo,
+       is_activating_hotspot_allo = i.is_activating_hotspot_allo)]
+
+finite_vals <- final_dt_pockets_plot$log2_or_act_allo[is.finite(final_dt_pockets_plot$log2_or_act_allo)]
+limit_val <- if(length(finite_vals) > 0) max(abs(finite_vals), na.rm = TRUE) else 1
+if(limit_val == 0) limit_val <- 1
+
+final_dt_pockets_plot[log2_or_act_allo == Inf,  log2_or_act_allo :=  limit_val]
+final_dt_pockets_plot[log2_or_act_allo == -Inf, log2_or_act_allo := -limit_val]
+
+p2_ALLO_act <- ggplot(final_dt_pockets_plot, aes(x = factor(global_pocket_cluster_ALL), y = factor(kinase,levels=rev(kinases)), fill = log2_or_act_allo)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient2(low = "grey80", mid = "white", high = "darkgreen",
+                         midpoint = 0, limits = c(-limit_val, limit_val), name = "Log2(OR)") +
+    theme_minimal() +
+  geom_text(aes(label = ifelse(is_activating_hotspot_allo == TRUE, "*", "")),
+            vjust = 0.7, size = 5,  color = "black") +
+    theme(axis.title.x = element_blank(),
+          panel.grid = element_blank(),
+          legend.position = "right",
+          legend.title = element_text(size = 8,angle = 90),
+          legend.title.position = "left",
+          legend.text = element_text(size = 6),
+          legend.key.size = unit(0.3, "cm"),
+          axis.text.x = element_blank(),
+          plot.title =element_text(size = 10))+
+    labs(y="")+
+    scale_y_discrete(labels = relabel_jnk2)
+```
+
+## Cap log2 OR: inactivating
+
+
+```{r}
+finite_vals <- final_dt_pockets_plot$log2_or_inact[is.finite(final_dt_pockets_plot$log2_or_inact)]
+limit_val <- if(length(finite_vals) > 0) max(abs(finite_vals), na.rm = TRUE) else 1
+if(limit_val == 0) limit_val <- 1
+
+
+final_dt_pockets_plot[log2_or_inact == Inf, log2_or_inact := limit_val]
+final_dt_pockets_plot[log2_or_inact == -Inf, log2_or_inact := -limit_val]
+```
+
+## Allosteric inactivating
+
+```{r}
+final_summary_allo[, enrich_inact_pval := phyper(
+  q = pocket_allo_inactivating_count - 1,
+  m = total_allo_inactivating_kin,
+  n = total_residues_kinase - total_allo_inactivating_kin,
+  k = pocket_size,
+  lower.tail = FALSE)]
+final_summary_allo[, c("a","b","c","d") := .(
+  pocket_allo_inactivating_count,
+  pocket_size - pocket_allo_inactivating_count,
+  total_allo_inactivating_kin - pocket_allo_inactivating_count,
+  (total_residues_kinase - total_allo_inactivating_kin) - (pocket_size - pocket_allo_inactivating_count))]
+final_summary_allo[, log2_or_inact_allo := log2((a * d) / (b * c))]
+final_summary_allo[, OR_inact_allo := (a * d) / (b * c)]
+final_summary_allo[, c("a","b","c","d") := NULL]
+final_summary_allo[, FDR_inact_allo := p.adjust(enrich_inact_pval, method = "fdr")]
+final_summary_allo[, is_inactivating_hotspot_allo := FDR_inact_allo < 0.1]
+
+final_dt_pockets_plot[final_summary_allo, on = c("kinase","gp_key"),
+  `:=`(log2_or_inact_allo           = i.log2_or_inact_allo,
+       OR_inact_allo                = i.OR_inact_allo,
+       FDR_inact_allo               = i.FDR_inact_allo,
+       is_inactivating_hotspot_allo = i.is_inactivating_hotspot_allo)]
+
+finite_vals <- final_dt_pockets_plot$log2_or_inact_allo[is.finite(final_dt_pockets_plot$log2_or_inact_allo)]
+limit_val <- if(length(finite_vals) > 0) max(abs(finite_vals), na.rm = TRUE) else 1
+if(limit_val == 0) limit_val <- 1
+
+final_dt_pockets_plot[log2_or_inact_allo == Inf,  log2_or_inact_allo :=  limit_val]
+final_dt_pockets_plot[log2_or_inact_allo == -Inf, log2_or_inact_allo := -limit_val]
+
+p2_ALLO_inact <- ggplot(final_dt_pockets_plot, aes(x = factor(global_pocket_cluster_ALL), y = factor(kinase,levels=rev(kinases)), fill = log2_or_inact_allo)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient2(low = "grey80", mid = "white", high = "darkgreen",
+                         midpoint = 0, limits = c(-limit_val, limit_val), name = "Log2(OR)") +
+    theme_minimal() +
+  geom_text(aes(label = ifelse(is_inactivating_hotspot_allo == TRUE, "*", "")),
+            vjust = 0.7, size = 5,  color = "black") +
+    theme(axis.title.x = element_blank(),
+          panel.grid = element_blank(),
+          legend.position = "none",
+          legend.title = element_text(size = 8,angle = 90),
+          legend.title.position = "left",
+          legend.text = element_text(size = 6),
+          legend.key.size = unit(0.3, "cm"),
+          axis.text.x = element_blank(),
+          plot.title =element_text(size = 10))+
+    labs(y="")+
+    scale_y_discrete(labels = relabel_jnk2)
+```
+
+## Druggability
+```{r}
+dt_is_global_pocket_cluster <-unique(pockets_allkin[, .(kinase,is_global_pocket_cluster,global_pocket_cluster_ALL,max_drug_score)])
+
+name_map_06 <- fread(paste0(data_pockets, "pocket_names.csv"))
+setnames(name_map_06, c("pocket_h06", "classic_pocket"))
+
+max_drug_stats_names <- merge(max_drug_stats, name_map_06,
+                              by.x = "global_pocket_cluster", by.y = "pocket_h06", all.x = TRUE)
+max_drug_stats_names[, cluster_label := fifelse(
+  classic_pocket!="",
+	paste0("(", classic_pocket,") ", global_pocket_cluster),
+	as.character(global_pocket_cluster)
+)]
+
+
+p_drug <- ggplot(max_drug_stats_names[!is.na(global_pocket_cluster)], aes(x = reorder(cluster_label, global_pocket_cluster), y = factor(kinase,levels=rev(kinases)))) +
+
+  geom_tile(aes(fill = max_drug_score),color="white") +
+  scale_fill_gradient(low = "white", high = "purple2",
+                      limits = c(0, 25),
+                      name = "Druggability") +
+
+  theme_minimal() +
+  labs(x="")+
+  theme(panel.grid = element_blank(),
+
+        legend.position = "right",
+        legend.title = element_text(size = 8, angle = 90),
+        legend.title.position = "left",
+        legend.text = element_text(size = 6),
+        legend.key.size = unit(0.3, "cm"),
+        axis.text.x = element_text(angle = 90,vjust = 0.5,hjust = 1),
+        plot.title =element_text(size = 10))+
+    labs(y="")+
+    scale_y_discrete(labels = relabel_jnk2)
+
+
+```
+
+## Inhibitor type
+
+```{r}
+type_lookup <- c(ATP = "I", DFG = "II",
+                 MT3 = "III",
+                 MPP = "IV", PIF = "IV", DRS = "IV", PDIG = "IV", DEF = "IV", LBP = "IV", EDI = "IV")
+
+pocket_types <- merge(
+  data.table(global_pocket_cluster_ALL = sort(unique(as.integer(as.character(
+    final_dt_pockets_plot$global_pocket_cluster_ALL))))),
+  name_map_06, by.x = "global_pocket_cluster_ALL", by.y = "pocket_h06", all.x = TRUE)
+pocket_types[classic_pocket == "", classic_pocket := NA_character_]
+pocket_types[, inhibitor_type := type_lookup[classic_pocket]]
+pocket_types[, type_source := fifelse(!is.na(inhibitor_type), "literature", NA_character_)]
+
+pocket_atp_dist <- pockets_allkin[!is.na(global_pocket_cluster_ALL),
+  .(atp_dist = mean(lig_dist, na.rm = TRUE)), by = global_pocket_cluster_ALL]
+pocket_atp_dist[, global_pocket_cluster_ALL := as.integer(as.character(global_pocket_cluster_ALL))]
+pocket_types <- merge(pocket_types, pocket_atp_dist, by = "global_pocket_cluster_ALL", all.x = TRUE)
+
+d_III <- pocket_types[inhibitor_type == "III", atp_dist]
+d_IV  <- pocket_types[inhibitor_type == "IV",  atp_dist]
+atp_thr <- mean(c(max(d_III, na.rm = TRUE), min(d_IV, na.rm = TRUE)))
+cat(sprintf("Type III/IV ATP-distance boundary = %.2f A (max named III = %.2f, min named IV = %.2f)\n",
+            atp_thr, max(d_III, na.rm = TRUE), min(d_IV, na.rm = TRUE)))
+
+pocket_types[is.na(inhibitor_type) & !is.na(atp_dist),
+  `:=`(inhibitor_type = fifelse(atp_dist <= atp_thr, "III", "IV"),
+       type_source    = "inferred (ATP distance)")]
+
+setorder(pocket_types, global_pocket_cluster_ALL)
+print(pocket_types[, .(global_pocket_cluster_ALL, classic_pocket,
+                       atp_dist = round(atp_dist, 1), inhibitor_type, type_source)])
+
+pocket_types[, gp_key := as.character(global_pocket_cluster_ALL)]
+final_dt_pockets_plot[pocket_types, on = "gp_key", inhibitor_type := i.inhibitor_type]
+
+type_cols <- c("I" = "#2c7fb8", "II" = "#41ab5d", "III" = "#fe9929", "IV" = "black")
+
+axis_dt <- unique(max_drug_stats_names[!is.na(global_pocket_cluster),
+                                       .(global_pocket_cluster, cluster_label)])
+axis_dt <- merge(axis_dt, pocket_types[, .(global_pocket_cluster_ALL, inhibitor_type)],
+                 by.x = "global_pocket_cluster", by.y = "global_pocket_cluster_ALL", all.x = TRUE)
+setorder(axis_dt, global_pocket_cluster)
+axis_cols <- type_cols[as.character(axis_dt$inhibitor_type)]
+axis_cols[is.na(axis_cols)] <- "grey50"
+
+leg_dt <- data.table(xlab = axis_dt$cluster_label[1], ylab = kinases[1],
+                     inhibitor_type = factor(c("I","II","III","IV"), levels = c("I","II","III","IV")))
+p_drug <- p_drug +
+  geom_point(data = leg_dt, aes(x = xlab, y = ylab, color = inhibitor_type),
+             alpha = 0, inherit.aes = FALSE) +
+  scale_color_manual(values = type_cols, drop = FALSE, name = "Inhibitor type") +
+  guides(color = guide_legend(order = 2, override.aes = list(alpha = 1, size = 2.5))) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, color = axis_cols))
+```
+
+# Supplementary Table 4
+```{r supp_pockets_table}
+supp_pockets <- copy(final_dt_pockets_plot)
+supp_pockets[pocket_types, on = "gp_key", classic_pocket := i.classic_pocket]
+supp_tab <- supp_pockets[, .(
+  pocket = as.integer(as.character(global_pocket_cluster_ALL)),
+  pocket_name = classic_pocket,
+  inhibitor_type,
+  kinase, kinase_display = relabel_jnk2(kinase),
+  pocket_size, n_residues,
+  median_ddGa_kcal_mol = round(median_mean_kcal, 3),
+  druggability_score = round(druggability_score, 2),
+  OR_activating_allosteric   = round(OR_act_allo, 3),
+  FDR_activating_allosteric  = signif(FDR_act_allo, 3),
+  OR_inactivating_allosteric = round(OR_inact_allo, 3),
+  FDR_inactivating_allosteric = signif(FDR_inact_allo, 3))]
+setorder(supp_tab, pocket, kinase)
+fwrite(supp_tab, paste0(results_path, "SuppTable_pockets.csv"))
+cat("Wrote SuppTable_pockets.csv:", nrow(supp_tab), "pocket x kinase rows\n")
+```
+
+# Pocket counts
+
+```{r pocket_manuscript_counts}
+n_kin_total <- length(kinases)
+
+mn <- unique(final_dt_pockets_plot[, .(
+  pocket     = as.integer(as.character(global_pocket_cluster_ALL)),
+  kinase     = as.character(kinase),
+  inhibitor_type,
+  act        = is_activating_hotspot        %in% TRUE,
+  inact      = is_inactivating_hotspot      %in% TRUE,
+  allo_enr   = is_enriched                  %in% TRUE,
+  act_allo   = is_activating_hotspot_allo   %in% TRUE,
+  inact_allo = is_inactivating_hotspot_allo %in% TRUE
+)])
+mn <- merge(mn,
+            unique(pocket_types[, .(pocket = global_pocket_cluster_ALL, classic_pocket)]),
+            by = "pocket", all.x = TRUE)
+
+by_pocket <- mn[, .(
+  n_act          = sum(act),
+  n_inact        = sum(inact),
+  n_act_allo     = sum(act_allo),
+  n_inact_allo   = sum(inact_allo),
+  inhibitor_type = inhibitor_type[1],
+  classic_pocket = classic_pocket[1]
+), by = pocket][order(pocket)]
+
+cat("\n================ DERIVED POCKET COUNTS (data-driven) ================\n")
+
+n_total_pockets <- uniqueN(by_pocket$pocket)
+n_enriched_any  <- by_pocket[n_act > 0 | n_inact > 0, .N]
+cat(sprintf("(1) Total pockets = %d\n", n_total_pockets))
+cat(sprintf("    Enriched (activating OR inactivating, FDR<0.1) in >=1 kinase = %d\n",
+            n_enriched_any))
+
+inact_all <- by_pocket[n_inact == n_kin_total]
+cat(sprintf("\n(2) Inhibitory (inactivating)-enriched in all %d kinases: %d pocket(s)\n",
+            n_kin_total, nrow(inact_all)))
+if (nrow(inact_all)) {
+  print(inact_all[, .(pocket, classic_pocket, inhibitor_type, n_inact)])
+  atp_all  <- inact_all[inhibitor_type == "I", pocket]
+  allo_all <- inact_all[is.na(inhibitor_type) | inhibitor_type != "I", pocket]
+  cat(sprintf("    ATP (Type I) pockets among these: %s\n",
+              if (length(atp_all)) paste(sort(atp_all), collapse = ", ") else "none"))
+  cat(sprintf("    non-ATP (allosteric) pockets among these: %s\n",
+              if (length(allo_all)) paste(sort(allo_all), collapse = ", ") else "none"))
+}
+
+n_act_any    <- by_pocket[n_act > 0, .N]
+n_act_single <- by_pocket[n_act == 1, .N]
+cat(sprintf("\n(3) Activating-enriched in >=1 kinase = %d pocket(s); single-kinase-only = %d\n",
+            n_act_any, n_act_single))
+cat(sprintf("    activating pockets: %s\n",
+            paste(sort(by_pocket[n_act > 0, pocket]), collapse = ", ")))
+
+switch_dt <- mn[, .(is_switch = {
+  ak <- unique(kinase[act]); ik <- unique(kinase[inact])
+  length(ak) > 0 && length(ik) > 0 && any(outer(ak, ik, `!=`))
+}), by = pocket]
+n_switch <- switch_dt[is_switch == TRUE, .N]
+cat(sprintf("\n(4) 'Switch' pockets (activating in one kinase, inactivating in another) = %d\n",
+            n_switch))
+cat(sprintf("    switch pockets: %s\n",
+            paste(sort(switch_dt[is_switch == TRUE, pocket]), collapse = ", ")))
+
+cat("\n---- for reference: active-site-excluded (allosteric) directional version ----\n")
+n_enriched_any_allo <- by_pocket[n_act_allo > 0 | n_inact_allo > 0, .N]
+n_inact_all_allo    <- by_pocket[n_inact_allo == n_kin_total, .N]
+n_act_any_allo      <- by_pocket[n_act_allo > 0, .N]
+n_act_single_allo   <- by_pocket[n_act_allo == 1, .N]
+switch_allo <- mn[, .(is_switch = {
+  ak <- unique(kinase[act_allo]); ik <- unique(kinase[inact_allo])
+  length(ak) > 0 && length(ik) > 0 && any(outer(ak, ik, `!=`))
+}), by = pocket][is_switch == TRUE, .N]
+cat(sprintf("    enriched (act OR inact allo) in >=1 kinase = %d\n", n_enriched_any_allo))
+cat(sprintf("    inact-allo-enriched in all %d kinases = %d ; pockets: %s\n",
+            n_kin_total, n_inact_all_allo,
+            paste(sort(by_pocket[n_inact_allo == n_kin_total, pocket]), collapse = ", ")))
+cat(sprintf("    act-allo-enriched in >=1 kinase = %d ; single-kinase-only = %d\n",
+            n_act_any_allo, n_act_single_allo))
+cat(sprintf("    switch (allo directional) = %d\n", switch_allo))
+cat("=====================================================================\n")
+```
+
+# Save Fig 7A
+```{r}
+p_matrices_allo<-ggarrange(p1_energy,p2_ALLO_act,p2_ALLO_inact,p_drug,ncol=1,align = "v",heights =c(1,1,1,2.2))
+ggsave(p_matrices_allo,filename =paste0(output_dir_fig,"Fig7A_pockets_summary",format_img),height =3.5,width = 6,limitsize = FALSE)
+```
+
+# Pocket energy heatmaps
+```{r pocket_energy_heatmaps}
+grid_pe <- unique(pos_pocket[!is.na(global_pocket_cluster_ALL),
+                             .(gpc = global_pocket_cluster_ALL, Pos_al)])
+grid_pe <- grid_pe[, .(kinase = kinases), by = .(gpc, Pos_al)]
+grid_pe <- merge(grid_pe,
+                 unique(allostery_enrichment_dt[assay == "Activity", .(kinase, Pos_al, pos_median)]),
+                 by = c("kinase", "Pos_al"), all.x = TRUE)
+grid_pe <- merge(grid_pe,
+                 unique(pocket_types[, .(gpc = global_pocket_cluster_ALL, classic_pocket)]),
+                 by = "gpc", all.x = TRUE)
+grid_pe[is.na(classic_pocket) | classic_pocket == "", classic_pocket := ""]
+grid_pe[, pocket_label := ifelse(classic_pocket == "", as.character(gpc),
+                                 paste0(gpc, " (", classic_pocket, ")"))]
+lab_levels_pe <- unique(grid_pe[order(gpc), .(gpc, pocket_label)])$pocket_label
+grid_pe[, pocket_label := factor(pocket_label, levels = lab_levels_pe)]
+grid_pe[, kinase := factor(kinase, levels = rev(kinases))]
+
+ENR_KEYS_PE <- c("A", "I")
+xlev_pe <- c(as.character(sort(unique(grid_pe$Pos_al))), ENR_KEYS_PE)
+grid_pe[, xkey := factor(as.character(Pos_al), levels = xlev_pe)]
+
+cap_pe <- as.numeric(quantile(abs(grid_pe$pos_median), 0.98, na.rm = TRUE))
+
+enr_src <- unique(final_summary_allo[, .(gpc = global_pocket_cluster_ALL, kinase,
+                                         log2_or_act_allo, is_activating_hotspot_allo,
+                                         log2_or_inact_allo, is_inactivating_hotspot_allo)])
+enr_pe <- rbind(
+  enr_src[, .(gpc, kinase, enr_type = "A", log2OR = log2_or_act_allo,   sig = is_activating_hotspot_allo)],
+  enr_src[, .(gpc, kinase, enr_type = "I", log2OR = log2_or_inact_allo, sig = is_inactivating_hotspot_allo)])
+enr_pe <- merge(CJ(gpc = unique(grid_pe$gpc), kinase = kinases, enr_type = ENR_KEYS_PE, unique = TRUE),
+                enr_pe, by = c("gpc", "kinase", "enr_type"), all.x = TRUE)
+cap_or_pe <- as.numeric(quantile(abs(enr_pe$log2OR[is.finite(enr_pe$log2OR)]), 0.98, na.rm = TRUE))
+enr_pe[is.nan(log2OR), log2OR := NA_real_]
+enr_pe[is.infinite(log2OR) & log2OR > 0, log2OR :=  cap_or_pe]
+enr_pe[is.infinite(log2OR) & log2OR < 0, log2OR := -cap_or_pe]
+enr_pe[is.na(sig), sig := FALSE]
+enr_pe <- merge(enr_pe, unique(grid_pe[, .(gpc, pocket_label)]), by = "gpc", all.x = TRUE)
+enr_pe[, pocket_label := factor(pocket_label, levels = lab_levels_pe)]
+enr_pe[, xkey := factor(enr_type, levels = xlev_pe)]
+enr_pe[, kinase := factor(kinase, levels = rev(kinases))]
+
+posn_pe <- unique(grid_pe[, .(gpc, Pos_al)])[, .(n = .N + 2L), by = gpc][order(gpc)]
+CAP_ROW_PE <- 95
+ri_pe <- integer(nrow(posn_pe)); cur_pe <- 1L; acc_pe <- 0
+for (i_pe in seq_len(nrow(posn_pe))) {
+  if (acc_pe > 0 && acc_pe + posn_pe$n[i_pe] > CAP_ROW_PE) { cur_pe <- cur_pe + 1L; acc_pe <- 0 }
+  ri_pe[i_pe] <- cur_pe; acc_pe <- acc_pe + posn_pe$n[i_pe]
+}
+posn_pe[, row := ri_pe]
+row_tot_pe <- posn_pe[, .(tot = sum(n)), by = row]
+maxT_pe <- max(row_tot_pe$tot)
+grid_pe <- merge(grid_pe, posn_pe[, .(gpc, row)], by = "gpc")
+enr_pe  <- merge(enr_pe,  posn_pe[, .(gpc, row)], by = "gpc")
+
+as_pos <- sort(unique(all_predicted_data[active_site != "", Pos_al]))
+
+theme_pe <- theme_classic(base_size = 11) +
+  theme(axis.text.x     = element_blank(),
+        axis.ticks.x    = element_blank(),
+        axis.line.x     = element_blank(),
+        axis.text.y     = element_text(size = 7),
+        panel.grid      = element_blank(),
+        panel.spacing.x = unit(2, "pt"),
+        strip.text      = element_text(face = "bold", size = 7),
+        plot.margin     = margin(2, 2, 2, 2))
+
+make_row_pe <- function(r, show_leg) {
+  dR <- grid_pe[row == r]; dE <- enr_pe[row == r]
+  xr <- unique(dR[, .(pocket_label, xkey, Pos_al)])
+  xr[, `:=`(lab = as.character(Pos_al), is_as = Pos_al %in% as_pos)]
+  xe <- unique(dE[, .(pocket_label, xkey)])
+  xe[, `:=`(lab = as.character(xkey), is_as = FALSE)]
+  xlab <- rbind(xr[, .(pocket_label, xkey, lab, is_as)], xe[, .(pocket_label, xkey, lab, is_as)])
+  g <- ggplot() +
+    geom_tile(data = dR, aes(x = xkey, y = kinase, fill = pos_median),
+              color = "grey85", linewidth = 0.2) +
+    scale_fill_gradientn(colours = c("blue3", "grey90", "brown3"),
+                         limits = c(-cap_pe, cap_pe), oob = scales::squish,
+                         na.value = "grey96", name = expression("Median "*Delta*Delta*G[a])) +
+    ggnewscale::new_scale_fill() +
+    geom_tile(data = dE, aes(x = xkey, y = kinase, fill = log2OR),
+              color = "grey40", linewidth = 0.3) +
+    scale_fill_gradient2(low = "grey70", mid = "grey95", high = "#1b7837",
+                         midpoint = 0, limits = c(-cap_or_pe, cap_or_pe),
+                         oob = scales::squish, na.value = "grey96",
+                         name = "log2(OR)\nallosteric",
+                         guide = if (show_leg) "colourbar" else "none") +
+    geom_text(data = dE[sig == TRUE], aes(x = xkey, y = kinase, label = "*"),
+              size = 3, vjust = 0.75, inherit.aes = FALSE) +
+    geom_text(data = xlab, aes(x = xkey, y = 0.4, label = lab, colour = is_as),
+              angle = 90, hjust = 1, vjust = 0.5, size = 2.4, inherit.aes = FALSE) +
+    scale_colour_manual(values = c(`TRUE` = "#E6A800", `FALSE` = "grey20"), guide = "none") +
+    facet_grid(~ pocket_label, scales = "free_x", space = "free_x") +
+    scale_y_discrete(labels = relabel_jnk2, expand = expansion(add = c(2.2, 0.6))) +
+    coord_cartesian(clip = "off") +
+    labs(x = NULL, y = NULL) + theme_pe
+  tot <- row_tot_pe[row == r, tot]
+  if (tot < maxT_pe) g <- g + plot_spacer() + plot_layout(widths = c(tot, maxT_pe - tot))
+  g
+}
+rid_pe <- sort(unique(grid_pe$row))
+p_pocket_energy <- wrap_plots(Map(make_row_pe, rid_pe, rid_pe == rid_pe[1]),
+                              ncol = 1, guides = "collect")
+
+ggsave(p_pocket_energy,
+       filename = paste0(output_dir_figS8, "FigS8C_pocket_energy_heatmaps", format_img),
+       width = 10, height = length(rid_pe) + 0.6, limitsize = FALSE)
+```
+
+# Pocket conservation
+
+## Sequence identity
+```{r}
+position_info<-unique(all_ddg_a[,.(kinase, Pos_al, WT_AA)])
+aa_counts <- position_info[, .N, by = .(Pos_al, WT_AA)]
+
+aa_counts[, total_seqs := sum(N), by = Pos_al]
+
+aa_counts[, p := N / total_seqs]
+
+conservation_dt <- unique(aa_counts[, .(
+	raw_identity = max(p),
+	n_seq = unique(total_seqs),
+
+	weighted_identity = max(p) * (total_seqs /5)
+), by = Pos_al])
+
+conservation_dt_sum<-conservation_dt[,.(Pos_al,weighted_identity)]
+```
+
+
+## Identity per pocket
+
+```{r}
+pocket_conservAA<-dplyr::left_join(pockets_allkin,conservation_dt_sum,by="Pos_al")
+
+
+unique_residues_identity <- unique(pocket_conservAA[, .(
+  kinase,
+  global_pocket_cluster_ALL,
+  Pos_al,
+  weighted_identity
+)])
+
+pocket_conservation_stats <- unique_residues_identity[!is.na(global_pocket_cluster_ALL), .(
+
+  avg_pocket_identity = mean(weighted_identity, na.rm = TRUE)
+
+), by = .(global_pocket_cluster_ALL)]
+```
+
+## Distance to ATP
+```{r}
+unique_residues_distance <- unique(pocket_conservAA[, .(
+  kinase,
+  global_pocket_cluster_ALL,
+  Pos_al,
+  lig_dist
+)])
+
+pocket_distanceATP <- unique_residues_distance[!is.na(global_pocket_cluster_ALL), .(
+
+  avg_pocket_distanceATP = mean(lig_dist, na.rm = TRUE)
+
+), by = .(global_pocket_cluster_ALL)]
+```
+
+## Structural divergence (RMSD)
+```{r}
+folder_path <- paste0(data_struct,"pdb_files_AF3")
+file_list <- list.files(path = folder_path, pattern = "\\.pdb$", full.names = TRUE)
+
+file_names <- tools::file_path_sans_ext(basename(file_list))
+
+all_pdbs <- lapply(file_list, read.pdb)
+names(all_pdbs) <- file_names
+
+unique_pockets <- unique(pockets_allkin[!is.na(global_pocket_cluster_ALL), global_pocket_cluster_ALL])
+
+results_dt <- data.table(
+	global_pocket_cluster_ALL = unique_pockets,
+	average_rmsd = as.numeric(NA)
+)
+
+for (pocket in unique_pockets) {
+	pocket_data <- pockets_allkin[global_pocket_cluster_ALL == pocket]
+
+	valid_kinases <- long_counts[global_pocket_cluster_ALL == pocket & n_residues >= 4, kinase]
+
+	pocket_data <- pocket_data[kinase %in% valid_kinases]
+
+	structures_in_pocket <- unique(pocket_data$kinase)
+
+	valid_structures <- intersect(structures_in_pocket, kinases)
+
+	if (length(valid_structures) >= 2) {
+
+		list_of_pos_al <- lapply(valid_structures, function(s) {
+			unique(pocket_data[kinase == s, Pos_al])
+		})
+		common_pos_al <- Reduce(intersect, list_of_pos_al)
+
+		if (length(common_pos_al) > 0) {
+
+			xyz_list <- lapply(valid_structures, function(s) {
+
+				s_data <- pocket_data[kinase == s & Pos_al %in% common_pos_al]
+
+				s_data <- s_data[order(Pos_al)]
+				actual_pos <- unique(s_data$Pos)
+
+				pdb_data <- all_pdbs[[s]]
+
+				ca_atoms <- atom.select(pdb_data, elety = "CA", resno = actual_pos)
+
+				return(pdb_data$xyz[ca_atoms$xyz])
+			})
+
+			try({
+				lengths <- sapply(xyz_list, length)
+				if (length(unique(lengths)) == 1) {
+
+					xyz_matrix <- do.call(rbind, xyz_list)
+
+					rmsd_matrix <- rmsd(xyz_matrix, fit = TRUE)
+
+					unique_scores <- rmsd_matrix[lower.tri(rmsd_matrix)]
+
+					avg_val <- mean(unique_scores, na.rm = TRUE)
+					results_dt[global_pocket_cluster_ALL == pocket, average_rmsd := avg_val]
+				}
+			}, silent = TRUE)
+		}
+	}
+}
+
+structural_conser<-results_dt
+```
+
+## Functional conservation
+
+
+```{r}
+correlation_effect <- unique(pockets_allkin[!is.na(global_pocket_cluster_ALL), .(WT_AA, pos_median, global_pocket_cluster_ALL, Pos_al, kinase)])
+
+get_cluster_correlations <- function(subset_dt) {
+
+  if (uniqueN(subset_dt$kinase) < 2) return(NULL)
+
+  cor_input <- dcast(subset_dt, Pos_al ~ kinase, value.var = "pos_median")
+
+  cor_matrix_data <- as.matrix(cor_input[, -1])
+
+  cor_results <- cor(cor_matrix_data, use = "pairwise.complete.obs", method = "pearson")
+
+  cor_values <- cor_results[upper.tri(cor_results)]
+
+  return(data.table(correlation = cor_values))
+}
+
+results_list <- lapply(split(correlation_effect, by = "global_pocket_cluster_ALL"), get_cluster_correlations)
+
+final_cor_data <- rbindlist(results_list, idcol = "Cluster")
+
+
+average_cor_by_pocket <- final_cor_data[, .(
+  mean_correlation = mean(correlation, na.rm = TRUE),
+  sd_correlation = sd(correlation, na.rm = TRUE),
+  median_correlation = median(correlation, na.rm = TRUE),
+  n_pairs = .N
+), by = Cluster]
+
+average_cor_by_pocket <- average_cor_by_pocket[order(-mean_correlation)]
+
+average_cor_by_pocket[,global_pocket_cluster_ALL:=as.integer(as.character(Cluster))]
+pocket_conservation_stats[,global_pocket_cluster_ALL:=as.integer(as.character(global_pocket_cluster_ALL))]
+info_cons_vs_funtion<-merge(average_cor_by_pocket,pocket_conservation_stats)
+
+```
+
+# ChimeraX: pocket residues
+```{r}
+dir.create(paste0(results_path, "00_chimera/02_pockets/"), showWarnings = FALSE, recursive = TRUE)
+for (k in kinases) {
+
+  current_pockets <- unique(pockets_allkin[kinase == k & !is.na(global_pocket_cluster_ALL), global_pocket_cluster_ALL])
+
+  for (p in current_pockets) {
+
+    subset_data <- pockets_allkin[kinase == k & global_pocket_cluster_ALL == p,
+                           .(val = median(`mean_kcal/mol`, na.rm=TRUE)),
+                           by = Pos]
+
+    if (nrow(subset_data) == 0) next
+
+    chimerax_lines <- c(
+      paste0("attribute: ddG_", p),
+      "recipient: residues",
+      paste0("\t:", subset_data$Pos, "\t", round(subset_data$val, 3))
+    )
+
+    clean_pocket_name <- gsub(" ", "_", p)
+    file_name <- file.path(paste0("../results/00_chimera/02_pockets/pockets_",k, "_", clean_pocket_name, ".defattr"))
+
+    writeLines(chimerax_lines, file_name)
+    }
+}
+```
+
+# Conservation scatter plots
+
+```{r}
+metrics_dt <- Reduce(function(x, y) merge(x, y, by = "global_pocket_cluster_ALL", all = TRUE), list(
+  structural_conser[,     .(global_pocket_cluster_ALL = as.integer(as.character(global_pocket_cluster_ALL)), average_rmsd)],
+  pocket_conservation_stats[, .(global_pocket_cluster_ALL = as.integer(as.character(global_pocket_cluster_ALL)), avg_pocket_identity)],
+  average_cor_by_pocket[, .(global_pocket_cluster_ALL = as.integer(as.character(global_pocket_cluster_ALL)), mean_correlation)],
+  pocket_distanceATP[,    .(global_pocket_cluster_ALL = as.integer(as.character(global_pocket_cluster_ALL)), avg_pocket_distanceATP)]
+))
+
+pocket_labels_s7 <- unique(max_drug_stats_names[!is.na(classic_pocket),
+                            .(global_pocket_cluster_ALL = as.integer(as.character(global_pocket_cluster)), classic_pocket)])
+metrics_dt <- merge(metrics_dt, pocket_labels_s7, by = "global_pocket_cluster_ALL", all.x = TRUE)
+metrics_dt[, pocket_label := fifelse(!is.na(classic_pocket), classic_pocket, as.character(global_pocket_cluster_ALL))]
+```
+
+## Metric pairs
+
+```{r}
+pairs_conserv <- list(
+  list("average_rmsd",        "avg_pocket_identity", "Structural divergence (Avg RMSD)", "Sequence conservation (identity)"),
+  list("average_rmsd",        "mean_correlation",    "Structural divergence (Avg RMSD)", "Functional conservation (effect r)"),
+  list("avg_pocket_identity", "mean_correlation",    "Sequence conservation (identity)",  "Functional conservation (effect r)")
+)
+```
+
+## Functional conservation vs structure and sequence
+
+```{r}
+ddga_global <- copy(final_dt_pockets_plot)
+ddga_global[, global_pocket_cluster_ALL := as.integer(as.character(global_pocket_cluster_ALL))]
+ddga_by_pocket <- ddga_global[, .(mean_ddGa = mean(median_mean_kcal, na.rm = TRUE)),
+                               by = global_pocket_cluster_ALL]
+
+metrics_dt_ddga <- merge(metrics_dt, ddga_by_pocket, by = "global_pocket_cluster_ALL", all.x = TRUE)
+
+ddga_lim <- max(abs(metrics_dt_ddga$mean_ddGa), na.rm = TRUE)
+
+make_scatter_s7_ddga <- function(dt, x_col, y_col, x_lab, y_lab, center = "mean") {
+  dt_plot  <- dt[!is.na(get(x_col)) & !is.na(get(y_col))]
+  r_val    <- cor(dt_plot[[x_col]], dt_plot[[y_col]], method = "pearson", use = "complete.obs")
+  fn       <- if (center == "median") median else mean
+  center_x <- fn(dt_plot[[x_col]], na.rm = TRUE)
+  center_y <- fn(dt_plot[[y_col]], na.rm = TRUE)
+  ggplot(dt_plot, aes(x = .data[[x_col]], y = .data[[y_col]])) +
+    geom_vline(xintercept = center_x, linetype = "dashed", color = "grey50", linewidth = 0.5) +
+    geom_hline(yintercept = center_y, linetype = "dashed", color = "grey50", linewidth = 0.5) +
+    geom_point(aes(fill = mean_ddGa), shape = 21, size = 4.5, alpha = 0.7,
+               colour = "grey30", stroke = 0.3) +
+    scale_fill_gradientn(
+      colours = c("blue3", "grey90", "brown3"),
+      values  = scales::rescale(c(-ddga_lim, 0, ddga_lim)),
+      limits  = c(-ddga_lim, ddga_lim),
+      oob     = scales::squish,
+      name    = expression("Median "*Delta*Delta*G[a])
+    ) +
+    geom_smooth(method = "lm", se = FALSE, color = "grey30", linewidth = 0.7) +
+    geom_text(aes(label = global_pocket_cluster_ALL), size = 3, vjust = 0.5, hjust = 0.5) +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+             label = sprintf("r = %.2f", r_val), size = 5, color = "black") +
+    labs(x = x_lab, y = y_lab) +
+    theme_classic(base_size = 13)
+}
+
+plots_c_ddga <- lapply(pairs_conserv, function(p)
+  make_scatter_s7_ddga(metrics_dt_ddga, p[[1]], p[[2]], p[[3]], p[[4]], center = "median"))
+fig_c_ddga <- ggarrange(plotlist = list(plots_c_ddga[[2]],plots_c_ddga[[3]]), ncol = 1, nrow = 2,
+                         common.legend = TRUE, legend = "top")
+ggsave(fig_c_ddga,
+       filename = paste0(output_dir_figS8, "FigS8B_pocket_conservation", format_img),
+       height = 7, width = 4, limitsize = FALSE)
+```
+
+## Sequence vs structure
+
+```{r}
+dt_ssi <- metrics_dt[!is.na(average_rmsd) & !is.na(avg_pocket_identity) & !is.na(mean_correlation)]
+r_ssi  <- cor(dt_ssi$average_rmsd, dt_ssi$avg_pocket_identity, method = "pearson", use = "complete.obs")
+
+p_struct_seq_funcons <- ggplot(metrics_dt_ddga,
+       aes(x = average_rmsd, y = avg_pocket_identity)) +
+  geom_vline(xintercept = mean(dt_ssi$average_rmsd,       na.rm = TRUE),
+             linetype = "dashed", color = "grey50", linewidth = 0.5) +
+  geom_hline(yintercept = mean(dt_ssi$avg_pocket_identity, na.rm = TRUE),
+             linetype = "dashed", color = "grey50", linewidth = 0.5) +
+    geom_point(aes(fill = mean_ddGa), shape = 21, size = 4.5, alpha = 0.7,
+               colour = "grey30", stroke = 0.3) +
+    scale_fill_gradientn(
+      colours = c("blue3", "grey90", "brown3"),
+      values  = scales::rescale(c(-ddga_lim, 0, ddga_lim)),
+      limits  = c(-ddga_lim, ddga_lim),
+      oob     = scales::squish,
+      name    = expression("Median "*Delta*Delta*G[a]))+
+  geom_smooth(method = "lm", se = FALSE, color = "grey30", linewidth = 0.7) +
+  geom_text(aes(label = global_pocket_cluster_ALL), size = 3, vjust = 0.5, hjust = 0.5) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+           label = sprintf("r = %.2f", r_ssi), size = 5, color = "black") +
+  labs(x = "Structural divergence (mean RMSD)",
+       y = "Sequence conservation (identity)") +
+  theme_classic(base_size = 13)
+
+ggsave(p_struct_seq_funcons,
+       filename = paste0(output_dir_fig, "Fig7B_conservation_vs_divergence", format_img),
+       height = 4, width = 5, limitsize = FALSE)
+```
+
+# Pairwise kinase comparison per pocket
+
+```{r pocket_pairwise_baseline, fig.width=6, fig.height=6}
+MIN_MUT <- 15; FDR_CUT <- 0.1
+
+apd_ns <- unique(all_predicted_data[active_site == "", .(kinase, Pos_al, mut_aa, ddg = `mean_kcal/mol`)])
+bgm <- apd_ns[, .(bg_median = median(ddg, na.rm = TRUE)), by = kinase]
+apd_ns <- merge(apd_ns, bgm, by = "kinase")
+apd_ns[, ddg_c := ddg - bg_median]
+
+pdp <- merge(pos_pocket[!is.na(global_pocket_cluster_ALL)], apd_ns,
+             by = c("kinase", "Pos_al"), allow.cartesian = TRUE)
+setnames(pdp, "global_pocket_cluster_ALL", "gpc")
+
+cliffs_delta <- function(a, b) {
+  n1 <- length(a); n2 <- length(b); if (n1 == 0 || n2 == 0) return(NA_real_)
+  r <- frank(c(a, b), ties.method = "average")
+  2 * ((sum(r[seq_len(n1)]) - n1 * (n1 + 1) / 2) / (n1 * n2)) - 1
+}
+pair_one <- function(dt) {
+  ks <- sort(dt[, .N, by = kinase][N >= MIN_MUT, kinase])
+  if (length(ks) < 2) return(data.table())
+  cb <- CJ(A = ks, B = ks)[A < B]
+  rbindlist(lapply(seq_len(nrow(cb)), function(i) {
+    a <- dt[kinase == cb$A[i], ddg_c]; b <- dt[kinase == cb$B[i], ddg_c]
+    w <- wilcox.test(a, b, alternative = "two.sided", exact = FALSE)
+    data.table(kinaseA = cb$A[i], kinaseB = cb$B[i], n_A = length(a), n_B = length(b),
+               cliffs_delta = cliffs_delta(a, b), pw_p = unname(w$p.value))
+  }))
+}
+pairwise_bl <- pdp[, pair_one(.SD), by = gpc]
+pairwise_bl[, pw_FDR := p.adjust(pw_p, "fdr")]
+
+pn <- pocket_types
+lab_of <- function(g) {
+  if (is.null(pn)) return(as.character(g))
+  m <- pn[match(g, global_pocket_cluster_ALL), classic_pocket]
+  ifelse(is.na(m) | m == "", as.character(g), paste0(g, " (", m, ")"))
+}
+pairwise_bl[, pocket_label := lab_of(gpc)]
+lab_levels <- pairwise_bl[order(gpc), unique(pocket_label)]
+
+mat <- rbind(
+  pairwise_bl[, .(pocket_label, row_k = kinaseA, col_k = kinaseB, delta =  cliffs_delta, sig = pw_FDR < FDR_CUT)],
+  pairwise_bl[, .(pocket_label, row_k = kinaseB, col_k = kinaseA, delta = -cliffs_delta, sig = pw_FDR < FDR_CUT)])
+mat[, `:=`(col_k = factor(relabel_jnk2(col_k), levels = relabel_jnk2(kinases)),
+           row_k = factor(relabel_jnk2(row_k), levels = rev(relabel_jnk2(kinases))),
+           pocket_label = factor(pocket_label, levels = lab_levels))]
+capm <- as.numeric(quantile(abs(mat$delta), 0.98, na.rm = TRUE))
+
+pp_pairwise <- ggplot(mat, aes(x = col_k, y = row_k, fill = delta)) +
+  geom_tile(colour = "grey88", linewidth = 0.2) +
+  geom_text(data = mat[sig == TRUE], aes(label = "*"), size = 3.6, vjust = 0.75) +
+  facet_wrap(~ pocket_label) +
+  scale_fill_gradient2(low = "#2166ac", mid = "grey95", high = "#b2182b", midpoint = 0,
+                       limits = c(-capm, capm), oob = scales::squish,
+                       name = "row kinase vs\ncolumn kinase\n(Cliff's d,\nbaseline-corrected)",
+                       breaks = c(-capm, 0, capm),
+                       labels = c("row more\nactivating", "same", "row more\ninactivating")) +
+  labs(x = "column kinase", y = "row kinase") +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        strip.text = element_text(face = "bold", size = 9), panel.grid = element_blank(),
+        legend.title = element_text(size = 8), legend.text = element_text(size = 6))
+
+nf <- uniqueN(mat$pocket_label); nc <- ceiling(sqrt(nf))
+ggsave(pp_pairwise, filename = paste0(output_dir_figS8, "FigS8D_pocket_pairwise", format_img),
+       width = max(4, 2.5 * nc + 1.5 - 10), height = max(4, 2.4 * ceiling(nf / nc) + 1 - 8), limitsize = FALSE)
+```
+
+
+# Pocket numbers for the text
+
+```{r}
+pk <- unique(final_dt_pockets_plot[, .(
+  p = as.integer(as.character(global_pocket_cluster_ALL)), k = as.character(kinase),
+  act = is_activating_hotspot_allo %in% TRUE, inact = is_inactivating_hotspot_allo %in% TRUE,
+  OR_act = OR_act_allo, OR_inact = OR_inact_allo)])
+conserved <- pk[, .(all5 = sum(inact) == length(kinases)), by = p][all5 == TRUE, p]
+atp_pockets <- pocket_types[inhibitor_type == "I", global_pocket_cluster_ALL]
+
+named <- unique(pocket_types[!is.na(classic_pocket) & classic_pocket != "", .(global_pocket_cluster_ALL, classic_pocket)])
+cat(sprintf("Pockets: %d ; named: %d pockets covering %d Kinase Atlas sites\n",
+            uniqueN(pk$p), nrow(named), uniqueN(named$classic_pocket)))
+cat("Inhibitory (allosteric) in all five kinases:", conserved, "\n")
+cat(sprintf("Mean pairwise C-alpha RMSD: ATP pockets %s = %s ; all %d pockets = %.2f\n",
+            paste(atp_pockets, collapse = ","),
+            paste(round(structural_conser[global_pocket_cluster_ALL %in% atp_pockets, average_rmsd], 2), collapse = ", "),
+            structural_conser[!is.na(average_rmsd), .N], mean(structural_conser$average_rmsd, na.rm = TRUE)))
+
+cat("\nAdditional enriched pockets per kinase (excluding ATP and conserved pockets):\n")
+print(pk[!p %in% c(atp_pockets, conserved), .(total = sum(act | inact), inhibitory = sum(inact), activating = sum(act)), by = k])
+
+by_p <- pk[, .(n_inact = sum(inact), inact_in = paste(k[inact], collapse = ","),
+               n_act = sum(act), act_in = paste(k[act], collapse = ",")), by = p][order(p)]
+cat("\nInhibitory in four or three kinases:\n")
+print(by_p[n_inact %in% 3:4, .(p, n_inact, inact_in)][order(-n_inact, p)])
+cat("OR, pockets in four kinases:\n")
+print(pk[inact == TRUE & p %in% by_p[n_inact == 4, p], .(p, k, OR_inact = round(OR_inact, 1))][order(p, k)])
+cat(sprintf("\nInhibitory pockets (excluding ATP): %d ; enriched in a single kinase: %d\n",
+            by_p[n_inact > 0 & !p %in% atp_pockets, .N], by_p[n_inact == 1 & !p %in% atp_pockets, .N]))
+cat(sprintf("Activating pockets: %d ; enriched in a single kinase: %d\n", by_p[n_act > 0, .N], by_p[n_act == 1, .N]))
+cat("Activating in two or more kinases:\n")
+print(pk[act == TRUE & p %in% by_p[n_act >= 2, p], .(p, k, OR_act = round(OR_act, 1))][order(p, k)])
+
+src_i <- pk[k == "SRC" & inact == TRUE, p]; fgr_i <- pk[k == "FGR" & inact == TRUE, p]
+cat("\nSRC and FGR shared inhibitory pockets:", sort(intersect(src_i, fgr_i)),
+    "; SRC-only (excluding ATP):", sort(setdiff(setdiff(src_i, fgr_i), atp_pockets)), "\n")
+
+shift_all <- function(pocket, kin, direction) {
+  others <- setdiff(kinases, kin)
+  all(sapply(others, function(o) {
+    r1 <- pairwise_bl[gpc == pocket & kinaseA == kin & kinaseB == o]
+    r2 <- pairwise_bl[gpc == pocket & kinaseA == o & kinaseB == kin]
+    d  <- if (nrow(r1)) r1$cliffs_delta else if (nrow(r2)) -r2$cliffs_delta else NA
+    q  <- if (nrow(r1)) r1$pw_FDR else if (nrow(r2)) r2$pw_FDR else NA
+    isTRUE(q < 0.1) && isTRUE(if (direction == "inhibitory") d > 0 else d < 0)
+  }))
+}
+single_inh <- pk[inact == TRUE & p %in% by_p[n_inact == 1, p] & !p %in% atp_pockets, .(p, k, OR = round(OR_inact, 1))]
+single_act <- pk[act == TRUE & p %in% by_p[n_act == 1, p], .(p, k, OR = round(OR_act, 1))]
+single_inh[, shifted_vs_all := mapply(shift_all, p, k, "inhibitory")]
+single_act[, shifted_vs_all := mapply(shift_all, p, k, "activating")]
+cat("\nSingle-kinase inhibitory pockets (high confidence = shifted vs all other kinases, FDR < 0.1):\n")
+print(single_inh[order(-shifted_vs_all, p)])
+cat("Single-kinase activating pockets (high confidence = shifted vs all other kinases, FDR < 0.1):\n")
+print(single_act[order(-shifted_vs_all, -OR)])
+```

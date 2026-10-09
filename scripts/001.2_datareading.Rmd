@@ -1,0 +1,407 @@
+---
+title: "001.2 Data reading"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(Biostrings)
+library(plyr)
+```
+
+# Setup
+
+```{r}
+load('source_variables.RData')
+knitr::opts_knit$set(root.dir = base_dir)
+
+
+results_path <- results_newdata
+dir.create(results_path, showWarnings = FALSE, recursive = TRUE)
+
+kinase_assays <- paste0(rep(kinases, each = length(assays)), "_", assays)
+data_each <- paste0(data_fitness, kinase_assays)
+```
+
+# Fitness data
+
+## In-house kinases (DiMSum)
+
+```{r read_data}
+fitness_list <- list()
+singles_list <- list()
+synonymous_list <- list()
+wildtype_list <- list()
+
+for (i in seq_along(kinase_assays)) {
+  now_kinase <- kinases[ceiling(i / 2)]
+  assay <- ifelse(i %% 2 == 0, full_assays[2], full_assays[1])
+
+  file_path <- file.path(data_each[i], paste0("dimsumRun_", kinase_assays[i], "_fitness_replicates.RData"))
+
+  if (file.exists(file_path)) {
+    message("Loading: ", file_path)
+    load(file_path)
+
+    all_variants <- as.data.table(all_variants)
+    singles <- as.data.table(singles)
+    synonymous <- as.data.table(synonymous)
+    wildtype <- as.data.table(wildtype)
+
+
+    for (dt in list(all_variants, singles, synonymous, wildtype)) {
+      dt[, kinase := now_kinase]
+      dt[, assay := assay]
+    }
+
+
+    if (assay == "activity") {
+      for (dt in list(all_variants, singles, synonymous, wildtype)) {
+        dt[, fitness := -fitness]
+      }
+    }
+
+    fitness_list[[i]] <- all_variants
+    singles_list[[i]] <- singles
+    synonymous_list[[i]] <- synonymous
+    wildtype_list[[i]] <- wildtype
+
+  } else {
+    warning(file_path, " does not exist.")
+  }
+}
+
+all_fitness <- rbindlist(fitness_list, fill = TRUE)
+all_singles <- rbindlist(singles_list, fill = TRUE)
+all_synonymous <- rbindlist(synonymous_list, fill = TRUE)
+all_wildtype <- rbindlist(wildtype_list, fill = TRUE)
+
+all_synonymous[, dataset := "synonymous"]
+all_doubles<-all_fitness[Nham_aa==2]
+all_doubles[,dataset:="doubles"]
+
+stops <- all_singles[STOP == TRUE]
+stops[, dataset := "stops"]
+
+all_singles_noSTOP <- all_singles[STOP == FALSE]
+all_singles_noSTOP[, dataset := "singles"]
+```
+
+## SRC (Beltran et al. 2024)
+
+```{r read_data_SRC}
+# SRC variant fitness is from Beltran et al. (Sci Adv 2024)
+# If the Beltran files are present (see README.md) SRC is included; otherwise
+# all_data is built for the four in-house kinases only.
+SRC_F <- paste0(data_fitness, "SRC_beltranetal/DiMSum_fitness_tables/SRC_fitness.txt")
+if (file.exists(SRC_F)) {
+SRC_fitness<-fread(SRC_F)
+
+
+selected_cols <- c("FL_kinase_fitness_scaled", "FL_kinase_sigma_scaled",
+                   "FL_sandwich_fitness_scaled", "FL_sandwich_sigma_scaled")
+
+fitness_long <- data.table::melt(
+  SRC_fitness,
+  measure.vars = selected_cols,
+  variable.name = "metric_full",
+  value.name = "value"
+)
+
+fitness_long[, assay := fifelse(grepl("^FL_kinase", metric_full), "activity", "abundance")]
+fitness_long[, metric := fifelse(grepl("fitness", metric_full), "fitness", "sigma")]
+
+id_cols <- setdiff(names(fitness_long), c("value", "metric", "metric_full"))
+
+fitness_long <- data.table::dcast(
+  fitness_long,
+  formula = paste(paste(id_cols, collapse = " + "), "~ metric"),
+  value.var = "value"
+)
+setDT(fitness_long)
+
+
+fitness_long[,kinase:="SRC"]
+common_cols <- intersect(names(fitness_long), names(all_fitness))
+SRC_long <- fitness_long[, ..common_cols]
+common_cols_singles <- intersect(names(fitness_long), names(all_singles))
+
+common_cols_singles<-c(common_cols_singles,"wt_aa_1","pos_1","mut_aa_1")
+
+SRC_singles<- fitness_long[Nham_aa==1,..common_cols_singles]
+setnames(SRC_singles,c("wt_aa_1","pos_1","mut_aa_1"),c("WT_AA","Pos","Mut"))
+
+
+setDT(all_fitness)
+setDT(SRC_long)
+setDT(all_singles)
+setDT(SRC_singles)
+
+missing_cols <- setdiff(names(all_fitness), names(SRC_long))
+missing_cols_singles <- setdiff(names(all_singles), names(SRC_singles))
+
+SRC_long[, (missing_cols) := NA]
+SRC_singles[, (missing_cols_singles) := NA]
+
+
+setcolorder(SRC_long, names(all_fitness))
+setcolorder(SRC_singles, names(all_singles))
+
+
+wt_full_seq <- "ESLRLEVKLGQGCFGEVWMGTWNGTTRVAIKTLKPGTMSPEAFLQEAQVMKKLRHEKLVQLYAVVSEEPIYIVTEYMSKGSLLDFLKGETGKYLRLPQLVDMAAQIASGMAYVERMNYVHRDLRAANILVGENLVCKVADFGLARLIEDNEYTARQGAKFPIKWTAPEAALYGRFTIKSDVWSFGILLTELTTKGRVPYPGMVNREVLDQVERGYRMPCPPECPESLHDLMCQCWRKEPEERPTFEYLQAFLEDYFTSTEPQYQPGENL"
+
+dtblock<-fread(paste0(data_fitness,"SRC_beltranetal/aa_variants_SRC_all"))
+
+
+SRC_long<-merge(SRC_long,dtblock[,1:2],by="aa_seq")
+
+block_positions <- list(
+    c(1, 59),
+    c(54, 114),
+    c(109, 168),
+    c(164, 224),
+    c(219, 269)
+)
+
+
+reconstruct_full_seq <- function(block_num, mut_block_seq, wt_seq, block_positions) {
+  wt_chars <- strsplit(wt_seq, "")[[1]]
+
+  pos <- block_positions[[block_num]]
+  start_pos <- pos[1]
+  end_pos <- pos[2]
+
+  mut_chars <- strsplit(mut_block_seq, "")[[1]]
+
+  if (length(mut_chars) != (end_pos - start_pos + 1)) {
+    stop(paste0("Length mismatch for block ", block_num))
+  }
+
+  wt_chars[start_pos:end_pos] <- mut_chars
+
+  full_seq <- paste0(wt_chars, collapse = "")
+  return(full_seq)
+}
+
+SRC_long[, full_seq := reconstruct_full_seq(block, aa_seq, wt_full_seq, block_positions), by=.(block, aa_seq)]
+
+SRC_long[,aa_seq:=NULL]
+SRC_long[,block:=NULL]
+
+setnames(SRC_long, "full_seq","aa_seq")
+
+
+src_wt_all <- SRC_long[WT == TRUE]
+wt_agg <- src_wt_all[, .(
+  fitness = weighted.mean(fitness, sigma^-2, na.rm = TRUE),
+  sigma   = sqrt(1 / sum(sigma^-2, na.rm = TRUE))
+), by = assay]
+src_wt <- src_wt_all[, .SD[1], by = assay]
+src_wt[wt_agg, on = "assay", `:=`(fitness = i.fitness, sigma = i.sigma)]
+
+SRC_long <- SRC_long[is.na(WT), ]
+
+SRC_long <- rbind(SRC_long, src_wt)
+SRC_long[assay=="activity",fitness:=-fitness]
+SRC_singles[assay=="activity",fitness:=-fitness]
+
+all_fitness <- rbind(all_fitness, SRC_long, use.names = TRUE, fill = FALSE)
+
+all_singles<-rbind(all_singles, SRC_singles, use.names = TRUE, fill = FALSE)
+
+stops_SRC<-SRC_singles[STOP==TRUE]
+stops_SRC[, dataset := "stops"]
+stops<-rbind(stops, stops_SRC, use.names = TRUE, fill = FALSE)
+
+SRC_doubles<-SRC_long[Nham_aa==2]
+SRC_doubles[,dataset:="doubles"]
+all_doubles<-rbind(all_doubles, SRC_doubles, use.names = TRUE, fill = FALSE)
+} else {
+  message("SRC (Beltran) fitness not found; building all_data for the four in-house kinases only. See README.md.")
+}
+
+all_singles_noSTOP <- all_singles[STOP == FALSE]
+all_singles_noSTOP[, dataset := "singles"]
+```
+
+## Save
+
+```{r}
+save(all_fitness,all_singles,all_synonymous,all_wildtype,all_singles_noSTOP,stops,all_doubles, file = paste0(results_path,"all_data.Rdata"))
+```
+
+# Fitness normalisation
+
+```{r}
+fitness_c <- data.table()
+
+for (i in kinases) {
+  for (j in full_assays) {
+    subtable <- all_singles[kinase == i & assay == j]
+    if (nrow(subtable) > 0) {
+    fitness_c <- rbind(fitness_c, normalization(subtable, i, j), fill = TRUE)
+    }
+  }
+}
+
+all_singles_c<-merge(all_singles,fitness_c,by.x=c("fitness"),by.y="real")
+setnames(all_singles_c,"normalised","fitness_norm")
+all_singles_c[kinase=="SRC",Pos:=Pos-267]
+```
+
+# Alignment
+
+## Alignment positions
+
+```{r}
+fastaFile <- readAAStringSet(paste0(data_alignment,"alignment_kincore.fasta"))
+seq_name = names(fastaFile)
+sequence = paste(fastaFile)
+df <- data.frame(seq_name, sequence)
+
+
+all_align <- data.table(Pos_al = 1:380)
+
+for (i in seq_along(df$sequence)){
+  aa_vect<-strsplit(df$sequence[i], "")[[1]]
+  all_align[[seq_name[i]]] <- aa_vect[1:380]
+}
+
+
+alignment_all <- melt(all_align, id.vars = "Pos_al", variable.name = "kinase", value.name = "WT_AA")
+
+setDT(alignment_all)
+alignment_pos <- data.table()
+
+for (j in kinases) {
+  alignment_prot <- alignment_all[kinase == j]
+  alignment_prot[, Pos := {
+    counter <- 0
+    sapply(WT_AA, function(x) if (x != "-") counter <<- counter + 1 else NA_integer_)
+  }]
+
+  alignment_pos <- rbindlist(list(alignment_pos, alignment_prot), use.names = TRUE, fill = TRUE)
+}
+
+save(alignment_pos, file = paste0(results_path, "alignment_pos.Rdata"))
+```
+
+## Singles on alignment
+
+```{r}
+all_singles_ca <- merge(
+  all_singles_c, alignment_pos,
+  by = c("Pos", "kinase", "WT_AA"),
+  all.y = TRUE
+)
+
+all_singles_ca<-all_singles_ca[!is.na(assay)]
+save(all_singles_ca, file = paste0(results_path, "all_singles_ca.Rdata"))
+```
+
+# MoCHI outputs
+
+## ddG
+
+```{r}
+full_assays <- c("Activity", "Folding")
+
+all_weights <- data.table()
+for (k in kinases) {
+  for (a in full_assays) {
+    file_path <- file.path(data_mochi, "weights", paste0(k, "_", a, ".txt"))
+    if (!file.exists(file_path))
+      stop("MoCHI weights not found: ", file_path,
+           "\nDownload data/mochi/ from the Zenodo deposit (see README.md).")
+    temp_data <- fread(file_path)
+    temp_data[, `:=`(kinase = k, assay = a)]
+    all_weights <- rbindlist(list(all_weights, temp_data), use.names = TRUE, fill = TRUE)
+  }
+}
+
+cols_to_remove <- grep("^fold_", names(all_weights), value = TRUE)
+cleaned_weights <- all_weights[, !cols_to_remove, with = FALSE]
+cleaned_weights[, WT_AA := substr(id, 1, 1)]
+
+cleaned_weights <- merge(
+  cleaned_weights, alignment_pos,
+  by = c("Pos", "kinase", "WT_AA"),
+  all.y = TRUE
+)
+cleaned_weights <- cleaned_weights[!is.na(assay)]
+cleaned_weights <- cleaned_weights[id != "WT"]
+cleaned_weights[, mut_aa := substr(as.character(id), nchar(as.character(id)), nchar(as.character(id)))]
+
+fwrite(cleaned_weights, file = paste0(results_path, "all_ddg.csv"))
+
+```
+## Predicted phenotypes
+```{r}
+predicted_phenotypes <- data.table()
+for (k in setdiff(kinases, "SRC")) {
+  file_path <- file.path(data_mochi, "predictions", paste0(k, "_predicted_phenotypes.txt"))
+  if (!file.exists(file_path))
+    stop("MoCHI predicted phenotypes not found: ", file_path,
+         "\nDownload data/mochi/ from the Zenodo deposit (see README.md).")
+  temp_data <- fread(file_path)
+  temp_data[, kinase := k]
+  predicted_phenotypes <- rbindlist(list(predicted_phenotypes, temp_data), use.names = TRUE, fill = TRUE)
+}
+
+src_pp <- file.path(data_mochi, "predictions", "SRC_predicted_phenotypes.txt")
+if (file.exists(src_pp)) {
+  src_predict <- fread(src_pp)
+  src_predict[, Abundance := as.integer(rowSums(.SD == 1) > 0), .SDcols = patterns("^Abundance_b")]
+  src_predict[, Activity  := as.integer(rowSums(.SD == 1) > 0), .SDcols = patterns("^Activity_b")]
+  common_cols <- intersect(colnames(src_predict), colnames(predicted_phenotypes))
+  src_predict <- src_predict[, ..common_cols]
+  src_predict[, kinase := "SRC"]
+  predicted_phenotypes <- rbind(predicted_phenotypes, src_predict)
+}
+
+fwrite(predicted_phenotypes, file = paste0(results_path, "predicted_phenotypes.csv"))
+
+```
+
+# Pilot data
+
+```{r read_pilot_data}
+pilot_path<-paste0(data_fitness,"pilot/")
+
+kinases_pilot<-c("FGR","MAPK9","TSSK2","ZAK")
+data_each<-unlist(lapply(kinases_pilot, function(x) paste0(pilot_path,x)))
+
+all_fitness = NULL
+all_singles =NULL
+all_synonymous =NULL
+all_wildtype=NULL
+for (i in 1:length(data_each)){
+  load(paste0(data_each[i],"/",kinases_pilot[i],"_pilot_varfile32_all/",kinases_pilot[i],"_pilot_varfile32_all_fitness_replicates.RData"))
+  all_variants$kinase<-kinases_pilot[i]
+  singles$kinase<-kinases_pilot[i]
+  synonymous$kinase<-kinases_pilot[i]
+  wildtype$kinase<-kinases_pilot[i]
+
+  all_fitness <- rbind.fill(all_fitness,all_variants)
+  all_singles <- rbind.fill(all_singles,singles)
+  all_synonymous<- rbind.fill(all_synonymous,synonymous)
+  all_wildtype<-rbind.fill(all_wildtype,wildtype)
+}
+
+
+all_synonymous$dataset<-"synonymous"
+
+stops<-all_singles[all_singles$STOP==TRUE,]
+stops$dataset<-"stops"
+
+all_singles_noSTOP<-all_singles[all_singles$STOP==FALSE,]
+all_singles_noSTOP$dataset<-"singles"
+
+fwrite(all_singles, file = paste0(results_path,"pilot_singles.csv"))
+fwrite(all_wildtype, file = paste0(results_path,"pilot_wildtype.csv"))
+fwrite(all_synonymous, file = paste0(results_path,"pilot_syn.csv"))
+
+
+```
+
+

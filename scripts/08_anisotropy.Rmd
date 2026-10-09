@@ -1,0 +1,565 @@
+---
+title: "08 Anisotropy"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(bio3d)
+library(patchwork)
+```
+
+# Setup
+
+```{r}
+load("source_variables.RData")
+
+output_dir <- paste0(results_path, "Fig4/")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+SRC_2SRC_OFFSET <- 264
+
+SLAB_THRESH <- 10
+SIGN_TOL <- 2
+CURVE_MAX <- 35
+```
+
+# Load data
+
+```{r}
+all_ddg <- fread(paste0(results_newdata, "all_ddg_norm_clean.csv"))
+ddg_a <- all_ddg[assay == "Activity"]
+
+struct_feat <- fread(paste0(data_struct, "structural_features.csv"))
+```
+
+# Load 2SRC
+
+```{r}
+pdb_2src <- read.pdb(paste0(data_struct, "pdb_files_AF3/other/SRC_2src.pdb"),
+                     rm.alt = TRUE)
+```
+
+# Helper functions
+
+```{r}
+extract_ca_mat <- function(pdb, resno_vec, chain_id = "A") {
+  sel <- atom.select(pdb, elety = "CA", resno = resno_vec, chain = chain_id)
+  if (length(sel$atom) == 0) return(NULL)
+  mat <- matrix(pdb$xyz[sel$xyz], ncol = 3, byrow = TRUE)
+  colnames(mat) <- c("x", "y", "z")
+  rownames(mat) <- as.character(pdb$atom$resno[sel$atom])
+  mat
+}
+
+```
+
+# ChimeraX-aligned structures (2SRC frame)
+
+```{r}
+aligned_pdb_dir <- paste0(data_struct, "anisotropy_aligned")
+chimerax_files <- setNames(
+  file.path(aligned_pdb_dir, paste0(kinases, "_aligned_chimerax.pdb")),
+  kinases
+)
+
+missing_files <- chimerax_files[!file.exists(chimerax_files)]
+if (length(missing_files) > 0) {
+  stop("ChimeraX-aligned PDB files not found in ", aligned_pdb_dir, ":\n",
+       paste(basename(missing_files), collapse = "\n"),
+       "\nRun data/structural/anisotropy_aligned/align_kinases_to_2SRC.cxc in ChimeraX to regenerate them.")
+}
+
+aligned_pdbs_cx <- lapply(chimerax_files, read.pdb, rm.alt = TRUE)
+
+aligned_coords <- list()
+
+for (k in kinases) {
+  k_map <- struct_feat[kinase == k & !is.na(Pos_al),
+                       .(Pos, Pos_al)][order(Pos_al)]
+
+  k_ca      <- extract_ca_mat(aligned_pdbs_cx[[k]], k_map$Pos)
+  found_pos <- as.integer(rownames(k_ca))
+
+  dt <- data.table(
+    kinase = k,
+    Pos    = found_pos,
+    x_2src = k_ca[, "x"],
+    y_2src = k_ca[, "y"],
+    z_2src = k_ca[, "z"]
+  )
+  dt <- merge(dt, k_map[Pos %in% found_pos], by = "Pos", all.x = TRUE)
+
+  aligned_coords[[k]] <- dt
+}
+
+coords_dt <- rbindlist(aligned_coords)
+```
+
+# 2SRC crystal structure (reference)
+
+```{r}
+src_2src_pal_map <- struct_feat[kinase == "SRC" & !is.na(Pos_al),
+                                .(Pos, Pos_al)][order(Pos_al)]
+src_2src_ca      <- extract_ca_mat(pdb_2src, src_2src_pal_map$Pos + SRC_2SRC_OFFSET)
+src_2src_found   <- as.integer(rownames(src_2src_ca)) - SRC_2SRC_OFFSET
+
+src_2src_dt <- data.table(
+  kinase = "SRC_2src",
+  Pos    = src_2src_found,
+  x_2src = src_2src_ca[, "x"],
+  y_2src = src_2src_ca[, "y"],
+  z_2src = src_2src_ca[, "z"]
+)
+src_2src_dt <- merge(src_2src_dt,
+                     src_2src_pal_map[Pos %in% src_2src_found],
+                     by = "Pos", all.x = TRUE)
+aligned_coords[["SRC_2src"]] <- src_2src_dt
+coords_dt <- rbindlist(aligned_coords)
+
+kinases_all <- c(kinases, "SRC_2src")
+```
+
+# Signed xyz distances to the active site
+
+```{r}
+hrd_asp_resno <- 386L
+cat_sel <- atom.select(pdb_2src, resno = hrd_asp_resno, elety = c("OD1", "OD2"))
+cat_xyz <- matrix(pdb_2src$xyz[cat_sel$xyz], ncol = 3, byrow = TRUE)
+
+anp_sel <- atom.select(pdb_2src, resid = "ANP")
+anp_xyz <- matrix(pdb_2src$xyz[anp_sel$xyz], ncol = 3, byrow = TRUE)
+
+ref_xyz     <- rbind(cat_xyz, anp_xyz)
+anp_centroid <- colMeans(anp_xyz)
+
+min_signed <- function(ca_coord, ref_col) {
+  d <- ca_coord - ref_col
+  d[which.min(abs(d))]
+}
+
+for (k in kinases_all) {
+  k_dt <- aligned_coords[[k]]
+  k_dt[, dx := mapply(min_signed, x_2src, MoreArgs = list(ref_col = ref_xyz[, 1]))]
+  k_dt[, dy := mapply(min_signed, y_2src, MoreArgs = list(ref_col = ref_xyz[, 2]))]
+  k_dt[, dz := mapply(min_signed, z_2src, MoreArgs = list(ref_col = ref_xyz[, 3]))]
+  aligned_coords[[k]] <- k_dt
+}
+
+coords_dt <- rbindlist(aligned_coords)
+```
+
+
+# Directional datasets
+
+```{r}
+directions <- list(
+  "x+" = list(axis = "dx", sign = +1),
+  "x-" = list(axis = "dx", sign = -1),
+  "y+" = list(axis = "dy", sign = +1),
+  "y-" = list(axis = "dy", sign = -1),
+  "z+" = list(axis = "dz", sign = +1),
+  "z-" = list(axis = "dz", sign = -1)
+)
+
+src_2src_ddga_vars <- copy(ddg_a[kinase == "SRC"])
+src_2src_ddga_vars[, kinase := "SRC_2src"]
+ddg_a_all <- rbind(ddg_a, src_2src_ddga_vars)
+
+coords_ddga_vars <- merge(
+  coords_dt[, .(kinase, Pos, Pos_al, dx, dy, dz)],
+  ddg_a_all[, .(kinase, Pos, Pos_al, abs_ddga = abs(`mean_kcal/mol`))],
+  by = c("kinase", "Pos", "Pos_al"), all.x = FALSE
+)
+
+dir_data <- rbindlist(lapply(names(directions), function(d) {
+  info     <- directions[[d]]
+  axis_col <- info$axis
+  sign_val <- info$sign
+
+  other_cols <- setdiff(c("dx", "dy", "dz"), axis_col)
+
+  sub <- copy(coords_ddga_vars)
+  sub[, axis_val := get(axis_col)]
+  sub[, orth1    := get(other_cols[1])]
+  sub[, orth2    := get(other_cols[2])]
+
+  sub <- sub[sign_val * axis_val > -SIGN_TOL &
+             abs(orth1) <= SLAB_THRESH &
+             abs(orth2) <= SLAB_THRESH]
+
+  sub[, dist      := abs(axis_val)]
+  sub[, direction := d]
+  sub[, axis_lab  := gsub("[+-]", "", d)]
+
+  sub[, .(kinase, Pos, Pos_al, direction, axis_lab,
+          dist, dx, dy, dz, abs_ddga)]
+}))
+
+dir_data[, kinase    := factor(kinase, levels = kinases_all)]
+dir_data[, direction := factor(direction,
+  levels = c("x+", "x-", "y+", "y-", "z+", "z-"))]
+
+```
+
+# Exponential decay fitting
+
+```{r}
+fit_decay_one <- function(data, min_n = 5) {
+  if (nrow(data) < min_n || all(is.na(data$abs_ddga))) return(NULL)
+  tryCatch({
+    fit <- nls(abs_ddga ~ a * exp(b * dist),
+               data  = data,
+               start = list(a = 0.5, b = -0.05),
+               control = nls.control(maxiter = 200, warnOnly = TRUE))
+    co    <- coef(fit)
+    k_se  <- tryCatch(summary(fit)$coefficients["b", "Std. Error"],
+                      error = function(e) NA_real_)
+    r2    <- cor(fitted(fit), data$abs_ddga, use = "complete.obs")^2
+    d_half <- log(2) / abs(co["b"])
+    data.table(a = co["a"], k = co["b"], k_se = k_se,
+               d_half = d_half, r2 = r2, n = nrow(data))
+  }, error = function(e) {
+    message("Fit failed: ", conditionMessage(e))
+    NULL
+  })
+}
+
+decay_params <- rbindlist(lapply(kinases_all, function(kin) {
+  rbindlist(lapply(levels(dir_data$direction), function(d) {
+    sub <- dir_data[kinase == kin & direction == d]
+    res <- fit_decay_one(sub)
+    if (!is.null(res)) {
+      res[, `:=`(kinase = kin, direction = d)]
+    }
+    res
+  }), fill = TRUE)
+}), fill = TRUE)
+
+decay_params[, kinase    := factor(kinase, levels = kinases_all)]
+decay_params[, direction := factor(direction,
+  levels = c("x+", "x-", "y+", "y-", "z+", "z-"))]
+decay_params[, abs_k     := abs(k)]
+
+```
+
+# Confidence intervals and pairwise comparison
+
+```{r decay_ci_and_comparison}
+decay_ci <- copy(decay_params)
+decay_ci[, ci_lo := log(2) / (abs(k) + 1.96 * k_se)]
+decay_ci[, ci_hi := log(2) / (abs(k) - 1.96 * k_se)]
+setorder(decay_ci, kinase, direction)
+cat("== d_half with 95% CI (Wald CI on k, transformed) ==\n")
+print(decay_ci[, .(kinase, direction,
+                   d_half = round(d_half, 1),
+                   CI = sprintf("%.1f-%.1f", ci_lo, ci_hi))])
+
+cat("\n== Median d_half per direction (5 kinases, SRC_2src excluded) ==\n")
+print(decay_params[kinase %in% kinases, .(median_dhalf = median(d_half, na.rm=TRUE)), by = direction][order(-median_dhalf)])
+
+compare_decay <- function(kin1, dir1, kin2, dir2) {
+  r1 <- decay_params[kinase == kin1 & direction == dir1]
+  r2 <- decay_params[kinase == kin2 & direction == dir2]
+  z  <- (r1$k - r2$k) / sqrt(r1$k_se^2 + r2$k_se^2)
+  data.table(
+    group1 = sprintf("%s %s", kin1, dir1), d_half1 = round(r1$d_half, 1),
+    group2 = sprintf("%s %s", kin2, dir2), d_half2 = round(r2$d_half, 1),
+    z = round(z, 2), p_two_sided = 2 * pnorm(-abs(z)))
+}
+
+decay_compare <- rbindlist(list(
+  compare_decay("FGR",   "z+", "SRC",   "z+"),
+  compare_decay("ZAK",   "y+", "MAPK9", "y+"),
+  compare_decay("MAPK9", "x-", "ZAK",   "x-")
+))
+cat("\n== Pairwise z-test on decay constants ==\n")
+print(decay_compare)
+```
+
+# Kinase colours
+
+```{r}
+kin_colors <- c(setNames(scales::hue_pal()(length(kinases)), kinases),
+                "SRC_2src" = "grey30")
+```
+
+
+# d½ per direction (wide)
+
+```{r}
+reach_wide <- data.table::dcast(decay_params, kinase ~ direction, value.var = "d_half")
+dir_map <- c("x+" = "xp", "x-" = "xm", "y+" = "yp", "y-" = "ym", "z+" = "zp", "z-" = "zm")
+existing <- intersect(names(reach_wide), names(dir_map))
+if (length(existing)) setnames(reach_wide, existing, dir_map[existing])
+for (nm in dir_map) if (!nm %in% names(reach_wide)) reach_wide[, (nm) := NA_real_]
+```
+
+# Fig 4E: directional reach
+
+```{r plot_G2, fig.width=14, fig.height=4, message=FALSE, warning=FALSE, dev="svg"}
+THETA <- 35 * pi / 180
+PHI   <- 22 * pi / 180
+
+axis_pad <- 3
+arm_lim <- function(dir) {
+  ceiling(max(decay_params[direction == dir, d_half], na.rm = TRUE)) + axis_pad
+}
+lim_xp <- arm_lim("x+"); lim_xm <- arm_lim("x-")
+lim_yp <- arm_lim("y+"); lim_ym <- arm_lim("y-")
+lim_zp <- arm_lim("z+"); lim_zm <- arm_lim("z-")
+
+proj3d <- function(x, y, z) {
+  tmp <- x; x <- -y; y <- tmp
+  x <- -x; y <- -y; z <- -z
+  x1 <-  cos(THETA) * x + sin(THETA) * y
+  y1 <- -sin(THETA) * x + cos(THETA) * y
+  sx    <- x1
+  sy    <- -sin(PHI) * y1 + cos(PHI) * z
+  depth <-  cos(PHI) * y1 + sin(PHI) * z
+  data.table(sx = sx, sy = sy, depth = depth)
+}
+
+origin_p <- proj3d(0, 0, 0)
+
+seg_list <- lapply(seq_len(nrow(reach_wide)), function(i) {
+  row <- reach_wide[i]
+  k   <- as.character(row$kinase)
+  ends <- data.table(
+    direction = c("x+",     "x-",     "y+",     "y-",     "z+",     "z-"),
+    ex        = c(row$xp, -row$xm,       0,        0,        0,        0),
+    ey        = c(   0,       0,    row$yp, -row$ym,        0,        0),
+    ez        = c(   0,       0,       0,        0,    row$zp, -row$zm)
+  )
+  ep <- proj3d(ends$ex, ends$ey, ends$ez)
+  data.table(
+    kinase    = k,
+    direction = ends$direction,
+    sx1 = origin_p$sx, sy1 = origin_p$sy,
+    sx2 = ep$sx,       sy2 = ep$sy,
+    depth = ep$depth
+  )
+})
+
+segs <- rbindlist(seg_list)
+segs[, kinase := factor(kinase, levels = kinases_all)]
+setorder(segs, -depth)
+
+ax_ends <- list(
+  list(ex= lim_xp, ey=0,       ez=0,       label="x+"),
+  list(ex=-lim_xm, ey=0,       ez=0,       label="x−"),
+  list(ex=0,       ey= lim_yp, ez=0,       label="y+"),
+  list(ex=0,       ey=-lim_ym, ez=0,       label="y−"),
+  list(ex=0,       ey=0,       ez= lim_zp, label="z+"),
+  list(ex=0,       ey=0,       ez=-lim_zm, label="z−")
+)
+
+ax_segs <- rbindlist(lapply(ax_ends, function(a) {
+  ep <- proj3d(a$ex, a$ey, a$ez)
+  data.table(sx1 = origin_p$sx, sy1 = origin_p$sy,
+             sx2 = ep$sx,       sy2 = ep$sy)
+}))
+
+ax_labels <- rbindlist(lapply(ax_ends, function(a) {
+  ep <- proj3d(a$ex * 1.12, a$ey * 1.12, a$ez * 1.12)
+  data.table(sx = ep$sx, sy = ep$sy, label = a$label)
+}))
+
+tick_len <- 1.5
+tick_pos <- c(x = lim_xp, y = lim_yp, z = lim_zp)
+tick_neg <- c(x = lim_xm, y = lim_ym, z = lim_zm)
+
+tick_segments <- rbindlist(lapply(c("x", "y", "z"), function(ax) {
+  d3 <- switch(ax,
+               x = c(1, 0, 0),
+               y = c(0, 1, 0),
+               z = c(0, 0, 1))
+  tv <- c(
+    seq(10, floor(tick_pos[[ax]] / 10) * 10, by = 10),
+   -seq(10, floor(tick_neg[[ax]] / 10) * 10, by = 10)
+  )
+  axis_proj <- proj3d(d3[1], d3[2], d3[3])
+  dir2d  <- c(axis_proj$sx - origin_p$sx, axis_proj$sy - origin_p$sy)
+  dir2d  <- dir2d / sqrt(sum(dir2d^2))
+  perp2d <- c(-dir2d[2], dir2d[1])
+  rbindlist(lapply(tv, function(t) {
+    p <- proj3d(d3[1] * t, d3[2] * t, d3[3] * t)
+    data.table(
+      sx1 = as.numeric(p$sx) - perp2d[1] * tick_len,
+      sy1 = as.numeric(p$sy) - perp2d[2] * tick_len,
+      sx2 = as.numeric(p$sx) + perp2d[1] * tick_len,
+      sy2 = as.numeric(p$sy) + perp2d[2] * tick_len,
+      val = t
+    )
+  }))
+}))
+
+dir_colors_ax <- c(
+  "x-" = "#FF8080",
+  "x+" = "#CC0000",
+  "y-" = "#80AAFF",
+  "y+" = "#0047AB",
+  "z-" = "gold",
+  "z+" = "#ca9e0e"
+)
+
+make_kin_plot <- function(k) {
+  segs_k <- segs[as.character(kinase) == k]
+  ggplot() +
+    geom_segment(data = ax_segs,
+                 aes(x = sx1, y = sy1, xend = sx2, yend = sy2),
+                 color = "grey75", linewidth = 0.4, linetype = "solid") +
+
+    geom_segment(data = segs_k,
+                 aes(x = sx1, y = sy1, xend = sx2, yend = sy2,
+                     color = direction),
+                 linewidth = 2.2, lineend = "butt", linejoin = "mitre", alpha = 1,
+                 arrow = arrow(angle = 17, type = "closed", ends = "last",
+                               length = unit(0.2, "cm"))) +
+    geom_point(aes(x = as.numeric(origin_p$sx), y = as.numeric(origin_p$sy)),
+               color = "black", size = 1.2) +
+    geom_text(data = ax_labels,
+              aes(x = sx, y = sy, label = label),
+              size = 4, color = "black", lineheight = 0.85) +
+    geom_segment(data = tick_segments,
+              aes(x = sx1, y = sy1, xend = sx2, yend = sy2),
+              color = "grey30", linewidth = 0.2) +
+
+    scale_color_manual(values = dir_colors_ax, name = "Direction") +
+    coord_fixed(clip = "off") +
+    theme_void(base_size = 13) +
+    theme(legend.position = "none")
+}
+
+plots_G2 <- lapply(kinases, make_kin_plot)
+
+p_G2 <- patchwork::wrap_plots(plots_G2, ncol = length(kinases))
+
+ggsave(file.path(output_dir, "Fig4E_anisotropy_axes.pdf"),
+       p_G2, width = 14, height = 5)
+```
+
+# Fig 4E: axis guide
+
+```{r plot_G2_axis_guide, fig.width=3, fig.height=3, message=FALSE, warning=FALSE, dev="svg"}
+guide_lim   <- 20
+guide_lim_z <- 17
+
+guide_segs <- data.table(
+  direction = factor(c("x+", "y+", "z+"),
+                     levels = c("x+", "x-", "y+", "y-", "z+", "z-")),
+  ex = c(guide_lim, 0,         0),
+  ey = c(0,         guide_lim, 0),
+  ez = c(0,         0,         guide_lim_z)
+)
+guide_ep <- proj3d(guide_segs$ex, guide_segs$ey, guide_segs$ez)
+guide_segs[, `:=`(
+  sx1 = origin_p$sx, sy1 = origin_p$sy,
+  sx2 = guide_ep$sx, sy2 = guide_ep$sy
+)]
+
+guide_ax_segs <- rbindlist(lapply(seq_len(nrow(guide_segs)), function(i) {
+  r  <- guide_segs[i]
+  ep <- proj3d(r$ex * 1.05, r$ey * 1.05, r$ez * 1.05)
+  data.table(sx1 = origin_p$sx, sy1 = origin_p$sy,
+             sx2 = ep$sx,       sy2 = ep$sy)
+}))
+p_G2_guide <- ggplot() +
+  geom_segment(data = guide_ax_segs,
+               aes(x = sx1, y = sy1, xend = sx2, yend = sy2),
+               color = "grey80", linewidth = 0.6) +
+  geom_segment(data = guide_segs,
+               aes(x = sx1, y = sy1, xend = sx2, yend = sy2,
+                   color = direction),
+               linewidth = 2.2, lineend = "butt", linejoin = "mitre", alpha = 1,
+               arrow = arrow(angle = 20, type = "closed", ends = "last",
+                             length = unit(0.35, "cm"))) +
+  geom_point(aes(x = as.numeric(origin_p$sx), y = as.numeric(origin_p$sy)),
+             color = "black", size = 1.2) +
+  scale_color_manual(values = dir_colors_ax) +
+  coord_fixed(clip = "off") +
+  theme_void(base_size = 13) +
+  theme(legend.position = "none")
+
+p_G2_guide
+
+ggsave(file.path(output_dir, "Fig4E_axis_guide.png"),
+       p_G2_guide, width = 3, height = 3)
+```
+
+# ChimeraX: d½ arrows (BILD)
+
+```{r bild_output, message=FALSE}
+bild_dir <- paste0(results_path, "00_chimera/anisotropy/")
+dir.create(bild_dir, showWarnings = FALSE, recursive = TRUE)
+
+ARROW_R1  <- 0.4
+ARROW_R2  <- 0.9
+ARROW_RHO <- 0.75
+
+hex_to_rgb01 <- function(hex) {
+  v <- col2rgb(hex) / 255
+  sprintf("%.3f %.3f %.3f", v[1,1], v[2,1], v[3,1])
+}
+
+ox <- anp_centroid[1]; oy <- anp_centroid[2]; oz <- anp_centroid[3]
+
+dir_names <- c("x+", "x-", "y+", "y-", "z+", "z-")
+
+endpoints_for <- function(row) {
+  list(
+    xp = c(ox + row$xp, oy,          oz),
+    xm = c(ox - row$xm, oy,          oz),
+    yp = c(ox,          oy + row$yp, oz),
+    ym = c(ox,          oy - row$ym, oz),
+    zp = c(ox,          oy,          oz + row$zp),
+    zm = c(ox,          oy,          oz - row$zm)
+  )
+}
+
+kinase_bild_lines <- function(k) {
+  row     <- reach_wide[kinase == k]
+  col_str <- hex_to_rgb01(kin_colors[[k]])
+  d_vals  <- c(row$xp, row$xm, row$yp, row$ym, row$zp, row$zm)
+  ep_list <- endpoints_for(row)
+
+  lines <- c(
+    sprintf("# Kinase: %s: allosteric reach (d½ per direction)", k),
+    sprintf(".color %s", col_str),
+    sprintf(".sphere %.2f %.2f %.2f 1.2", ox, oy, oz)
+  )
+  for (j in seq_along(ep_list)) {
+    ep <- ep_list[[j]]
+    lines <- c(lines,
+      sprintf("# %s  d½ = %.1f Å", dir_names[j], d_vals[j]),
+      sprintf(".arrow %.2f %.2f %.2f  %.2f %.2f %.2f  %.2f %.2f %.2f",
+              ox, oy, oz, ep[1], ep[2], ep[3],
+              ARROW_R1, ARROW_R2, ARROW_RHO)
+    )
+  }
+  lines
+}
+
+for (k in kinases_all) {
+  lines <- c(
+    "# Allosteric reach BILD: open alongside 2SRC or aligned kinase structure in ChimeraX",
+    sprintf("# ANP centroid origin: %.2f %.2f %.2f", ox, oy, oz),
+    kinase_bild_lines(k)
+  )
+  path <- file.path(bild_dir, sprintf("%s_allosteric_reach.bild", k))
+  writeLines(lines, path)
+}
+
+combined_lines <- c(
+  "# Allosteric reach (d½): all kinases in 2SRC coordinate frame",
+  "# Open alongside aligned_pdbs/2SRC_reference.pdb and axes_2SRC.bild in ChimeraX",
+  sprintf("# ANP centroid origin: %.2f %.2f %.2f", ox, oy, oz),
+  ""
+)
+for (k in kinases_all) {
+  combined_lines <- c(combined_lines, "", kinase_bild_lines(k))
+}
+combined_path <- file.path(bild_dir, "allosteric_reach_all_kinases.bild")
+writeLines(combined_lines, combined_path)
+```

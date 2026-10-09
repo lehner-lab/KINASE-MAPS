@@ -1,0 +1,195 @@
+---
+title: "001.1 Functions and shared variables"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+source("config.R")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Shared variables
+
+```{r}
+kinases <- c("SRC","FGR","ZAK","MAPK9","TSSK2")
+relabel_jnk2 <- function(x) gsub("MAPK9", "JNK2", x, fixed = TRUE)
+lab_kinase <- ggplot2::as_labeller(function(x) gsub("MAPK9", "JNK2", x, fixed = TRUE))
+assays <- c("T", "S")
+full_assays <- c("activity", "abundance")
+
+all_aa=c("G","A","V","L","M","I","F","Y","W","K","R","D","E","S","T","C","N","Q","H", "P","*")
+color_axis_y<-c("#FEC10BFF", rep("#15983DFF",6), rep("#EE0011FF", 2), rep("#0C5BB0FF", 2),rep("#9A703EFF", 3),  rep("darkgrey", 5), "#FA6B09FF" )
+```
+
+# Fitness functions
+
+## Replicate correlation
+
+```{r}
+plot_corr_rep_aux <- function(data, mapping, ...){
+  p <- ggplot(data = data, mapping = mapping) +
+    geom_pointdensity(size = 0.5) + scale_color_viridis(option = "magma", begin = 0.05, end = 0.85) +
+    geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed",linewidth = 0.5)+
+    ylim(-1,1)
+  p
+}
+
+plot_corr_rep <- function(subtable, name_col, kin, assay) {
+  table_subset <- subtable[, ..name_col]
+  setnames(table_subset, c("R1", "R2", "R3"))
+
+  p <- ggpairs(
+    table_subset,
+    title = paste0(relabel_jnk2(kin), " - ", assay),
+    diag = list(continuous = function(data, mapping, ...) {
+      ggally_text(rlang::as_label(mapping$x), col = "black", size = 5)
+    }),
+    lower = list(continuous = plot_corr_rep_aux),
+    method = "pearson",
+    upper=list(continuous = function(data, mapping, ...) {
+         ggally_cor(data = data, mapping = mapping, size = 6,justify_labels = "up", nudge_y=0.76, stars=F,title="")})
+    )+
+    theme_classic(base_size = 13) +
+    theme(
+      legend.position = "none",
+      strip.background = element_rect(fill = "white"),
+      strip.text = element_blank(),
+      axis.text.x = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      plot.title = element_text(size = 14)
+    )
+
+  return(p)
+}
+
+```
+
+## Normalisation
+
+```{r normalization}
+get_mode <- function(v) {
+  v <- v[!is.na(v) & is.finite(v)]
+  if (length(v) < 5) return(median(v))
+  d <- stats::density(v, n = 1024)
+  d$x[which.max(d$y)]
+}
+
+normalization <- function(data, kin, assay_now) {
+  mean_stop <- weighted.mean(
+    stops[kinase == kin & assay == assay_now, fitness],
+    stops[kinase == kin & assay == assay_now, sigma^-2],
+    na.rm = TRUE
+  )
+  if(kin!="SRC"){
+  mean_syn <- weighted.mean(
+    all_synonymous[kinase == kin & assay == assay_now, fitness],
+    all_synonymous[kinase == kin & assay == assay_now, sigma^-2],
+    na.rm = TRUE
+  )}else{
+    mean_syn <- get_mode(all_singles[kinase == kin & assay == assay_now &STOP==FALSE, fitness])
+  }
+
+  print(mean_stop)
+  print(mean_syn)
+
+  ZAK <- data.table("stops"=-0.6317643,"syn"=0.003864539)
+  linear_points <- data.table(
+    kin = c(mean_syn, mean_stop),
+    ZAK = c(ZAK$syn, ZAK$stops)
+  )
+
+  lm_model <- lm(ZAK ~ kin, data = linear_points)
+  print(lm_model)
+
+  fitness_c <- predict(lm_model, newdata = data.table(kin = all_singles[kinase == kin & assay == assay_now, fitness]))
+
+  return(data.table(
+    real = all_singles[kinase == kin & assay == assay_now, fitness],
+    normalised = fitness_c
+  ))
+}
+```
+
+## Fitness heatmap
+
+```{r plot_heatmap}
+plot_heatmap<-function(subtable,kin,assay,x_axis,x_labels){
+                  wt<-all_wildtype[all_wildtype$kinase==kin&all_wildtype$assay==assay,]$aa_seq
+                  seq<-unlist(strsplit(wt, ""))
+                  min<-abs(min(subtable[!is.na(subtable$fitness_norm),]$fitness_norm))
+                  max<-abs(max(subtable[!is.na(subtable$fitness_norm),]$fitness_norm))
+
+                    cols <- c(colorRampPalette(c( "brown3","gray92"), bias=1)((min/(min+max)*100)-0.5), colorRampPalette("gray92")(1),
+                          colorRampPalette(c( "gray92","blue3"))((max/(min+max)*100)-0.5))
+
+                  p_heatmap<-ggplot(subtable)+
+                    geom_tile(aes(x=subtable[,x_axis],y=factor(Mut, levels=rev(all_aa)),fill=fitness_norm),color="white", size=0.1)+
+                    theme_minimal()+
+                    labs(x="", y="", fill="Fitness",title = paste0(relabel_jnk2(kin)," ",assay))+
+                    theme(axis.ticks.y=element_blank(),
+                          axis.ticks.x.top = element_line(),
+                          panel.grid = element_blank(),
+                          panel.grid.major = element_blank(),
+                          panel.grid.minor = element_blank(),
+                          legend.title = element_text(size=13,face="bold"),
+                          legend.text = element_text(size=10),
+                          axis.text.y = element_text(color=color_axis_y, size=12),
+                          axis.text.x = element_text(size=7),
+                          axis.title = element_text(size = 13),
+                          panel.border = element_rect(color = "black", fill = NA, linewidth = 2),
+                          title =element_text(size = 15)
+                          )+
+                    geom_text(aes(subtable[,x_axis],factor(Mut, levels=rev(all_aa)),label=label), size=7)+
+                    scale_fill_gradientn(colours=cols, limits=c(-min,max), na.value = "grey70",labels=function(x) paste0(format(round(x, 1), nsmall = 1,justify="right"), ""))
+                  if(x_labels==TRUE){
+                    p_heatmap<-p_heatmap+scale_x_continuous(breaks=seq(1:length(seq)),labels = seq, expand = c(0,0))
+
+                  }else{
+                     p_heatmap<-p_heatmap+scale_x_continuous(breaks=seq(1:length(alignment_pos[alignment_pos$kinase==kin,]$WT_AA)),                                                      labels=alignment_pos[alignment_pos$kinase==kin,]$WT_AA,expand = c(0,0),limits = c(1,385))
+
+                  }
+                  return(p_heatmap)
+                }
+
+
+
+```
+
+# Plot helpers
+
+## Region labels
+
+```{r}
+fmt_region <- function(x) {
+  x <- sub("^B", "beta*", x)
+  x <- sub("^H", "alpha*", x)
+  x
+}
+```
+
+## Plot defaults
+
+```{r}
+ggsave <- function(filename, ...) {
+  args <- list(...)
+  if (grepl("\\.pdf$", filename, ignore.case = TRUE)) {
+    args$device <- grDevices::pdf
+    if (is.null(args$family)) args$family <- "Helvetica"
+  }
+  do.call(ggplot2::ggsave, c(list(filename = filename), args))
+}
+
+ggplot2::theme_set(
+  ggplot2::theme_classic(base_family = "Helvetica")
+)
+ggplot2::update_geom_defaults("text",  list(family = "Helvetica"))
+ggplot2::update_geom_defaults("label", list(family = "Helvetica"))
+```
+
+# Save
+
+```{r}
+save.image(file='source_variables.RData')
+
+```

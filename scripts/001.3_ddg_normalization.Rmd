@@ -1,0 +1,52 @@
+---
+title: "001.3 ddG normalization"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(readr)
+```
+
+# Setup
+
+```{r}
+load('source_variables.RData')
+```
+
+# Read ddG and structural features
+
+```{r}
+all_ddg <- read_csv(paste0(results_newdata, "all_ddg.csv"))
+structural_info <- read_csv(paste0(data_struct, "structural_features.csv"))
+all_ddg <- merge(all_ddg, structural_info, by = c("kinase", "Pos","Pos_al"),all.x=TRUE)
+setDT(all_ddg)
+
+all_ddg<-all_ddg[mut_aa!="*"]
+```
+
+# ddG normalisation
+
+```{r}
+HF_P<-all_ddg[Region_Name=="HF"&mut_aa=="P"&trait_name=="Folding"]
+stab<-as.data.table(HF_P)[, .(mode = quantile(`mean_kcal/mol`, probs = 0.75, na.rm = TRUE)), by = .(kinase, trait_name)]
+
+Mg_act<-all_ddg[active_site=="Mg positioning"&trait_name=="Activity"]
+act<-as.data.table(Mg_act)[, .(mode = quantile(`mean_kcal/mol`, probs = 0.75, na.rm = TRUE)), by = .(kinase, trait_name)]
+
+modes<-rbind(stab,act)
+
+all_ddg<-merge(all_ddg,modes,all.x=T,by=c("kinase","trait_name"))
+
+all_ddg[, `:=`(
+	ddg_norm      = ifelse(mode == 0, NA_real_, `mean_kcal/mol` / mode),
+	std_kcal_norm = ifelse(mode == 0, NA_real_, `std_kcal/mol` / abs(mode))
+)]
+
+all_ddg[, lobes := fifelse(
+  Pos_al <= 111, "N-lobe",
+  fifelse(Pos_al < 115, "hinge", "C-lobe")
+)]
+
+fwrite(all_ddg, file = paste0(results_newdata, "all_ddg_norm.csv"))
+```

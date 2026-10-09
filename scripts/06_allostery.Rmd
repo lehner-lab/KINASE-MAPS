@@ -1,0 +1,1713 @@
+---
+title: "06 Allostery enrichment"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(ggpubr)
+library(readr)
+library(scales)
+library(gridExtra)
+library(ggridges)
+library(ggnewscale)
+library(patchwork)
+library(ggpattern)
+library(ggh4x)
+```
+
+# Setup
+```{r}
+load("source_variables.RData")
+
+output_dir_fig3 <- paste0(results_path, "Fig3/")
+output_dir_fig5 <- paste0(results_path, "Fig5/")
+output_dir_figS6 <- paste0(results_path, "FigS6/")
+output_dir_figS7 <- paste0(results_path, "FigS7/")
+output_dir_chimera <- paste0(results_path, "00_chimera/")
+for (d in c(output_dir_fig3, output_dir_fig5, output_dir_figS6, output_dir_figS7))
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+```
+
+
+# Read data
+
+```{r}
+all_ddg<-fread(paste0(results_newdata,"all_ddg_norm_clean.csv"))
+
+
+all_ddg_a<-all_ddg[assay=="Activity"]
+
+all_predicted_data<-fread(paste0(results_path,"all_predicted_data.csv"))
+all_predicted_data <- all_predicted_data[, !duplicated(names(all_predicted_data)), with = FALSE]
+setDT(all_predicted_data)
+```
+
+```{r}
+all_ddg_a$kinase <- factor(all_ddg_a$kinase,levels = rev(kinases))
+```
+
+# Per-position ddGa summaries
+
+```{r}
+ddg_mean_a <- all_ddg_a[, .(pos_mean = weighted.mean(`mean_kcal/mol`, `std_kcal.mol`^-2, na.rm = TRUE)),
+                                by = .(Pos, kinase, assay,Pos_al)]
+all_ddg_a <- merge(all_ddg_a, ddg_mean_a,
+                  by = c("Pos", "kinase", "assay","Pos_al"),
+                  all.x = TRUE)
+ddg_median <- all_ddg[, .(pos_median = median(`mean_kcal/mol`, na.rm = TRUE)),
+                                 by = .(Pos, kinase, assay,Pos_al)]
+all_ddg_a <- merge(all_ddg_a, ddg_median,
+                   by = c("Pos", "kinase", "assay","Pos_al"),
+                   all.x = TRUE)
+```
+
+```{r}
+all_ddg_dist<-all_predicted_data
+```
+
+
+# Activity classifier and position enrichment
+
+```{r}
+all_ddg_dist[, z_tt   := (abs(`mean_kcal/mol`) - 0.2) / `std_kcal.mol`]
+all_ddg_dist[, p_tt   := 1 - pnorm(z_tt)]
+all_ddg_dist[, fdr_tt := p.adjust(p_tt, method = "fdr")]
+all_ddg_dist[, act_class := fcase(
+  fdr_tt < 0.1 & `mean_kcal/mol` < -0.2, "activating",
+  fdr_tt < 0.1 & `mean_kcal/mol` >  0.2, "inactivating",
+  default = "no change")]
+
+dist_noAS <- all_ddg_dist[active_site == ""]
+
+pos_counts <- dist_noAS[, .(
+  n_act   = sum(act_class == "activating"),
+  n_inact = sum(act_class == "inactivating"),
+  total_at_pos = .N
+), by = .(kinase, Pos_al)]
+pos_counts[, `:=`(n_act_allo = n_act, n_inact_allo = n_inact, n_measured = total_at_pos)]
+pos_counts[, net_allo_frac := (n_inact - n_act) / n_measured]
+
+kin_counts <- dist_noAS[, .(
+  act_in_kin   = sum(act_class == "activating"),
+  inact_in_kin = sum(act_class == "inactivating"),
+  total_in_kin = .N
+), by = kinase]
+
+cat(sprintf("Inhibitory allosteric mutations (inactivating, non-active-site): total = %d\n",
+            sum(kin_counts$inact_in_kin)))
+cat(sprintf("Activating allosteric mutations (activating, non-active-site):   total = %d\n",
+            sum(kin_counts$act_in_kin)))
+cat("Per kinase (activating / inactivating, non-active-site):\n")
+print(kin_counts[match(kinases, kinase), .(kinase, activating = act_in_kin, inhibitory = inact_in_kin)])
+
+enrichment_dt <- merge(pos_counts, kin_counts, by = "kinase")
+
+enrichment_dt[, `:=`(
+  not_act_at_pos   = total_at_pos - n_act,
+  act_other        = act_in_kin - n_act,
+  not_act_other    = (total_in_kin - total_at_pos) - (act_in_kin - n_act),
+  not_inact_at_pos = total_at_pos - n_inact,
+  inact_other      = inact_in_kin - n_inact,
+  not_inact_other  = (total_in_kin - total_at_pos) - (inact_in_kin - n_inact)
+)]
+
+run_fisher_greater <- function(a, b, c, d) {
+  res <- mapply(function(aa, bb, cc, dd) {
+    ft <- fisher.test(matrix(c(aa, cc, bb, dd), nrow = 2), alternative = "greater")
+    c(ft$p.value, ft$estimate)
+  }, a, b, c, d, SIMPLIFY = FALSE)
+  list(sapply(res, `[`, 1), sapply(res, `[`, 2))
+}
+
+enrichment_dt[, c("p_act", "or_act") :=
+  run_fisher_greater(n_act, not_act_at_pos, act_other, not_act_other)]
+enrichment_dt[, c("p_inact", "or_inact") :=
+  run_fisher_greater(n_inact, not_inact_at_pos, inact_other, not_inact_other)]
+
+enrichment_dt[, fdr_act   := p.adjust(p_act,   method = "fdr")]
+enrichment_dt[, fdr_inact := p.adjust(p_inact, method = "fdr")]
+
+setorder(enrichment_dt, p_act)
+```
+
+## Position enrichment table
+
+```{r}
+enrichment_dt_sum <- enrichment_dt[, .(kinase, Pos_al,
+                                        or_act, fdr_act, or_inact, fdr_inact,
+                                        n_act_allo, n_inact_allo, n_measured, net_allo_frac)]
+ddg_median_a <- ddg_median[assay == "Activity"]
+enrichment_dt_median <- merge(ddg_median_a, enrichment_dt_sum,
+                              by = c("kinase", "Pos_al"), all.x = TRUE)
+
+enrichment_dt_median[, enrich_act   := !is.na(fdr_act)   & fdr_act   < 0.1]
+enrichment_dt_median[, enrich_inact := !is.na(fdr_inact) & fdr_inact < 0.1]
+enrichment_dt_median[, enrich_allostery := enrich_act | enrich_inact]
+enrichment_dt_median[, allo_dir_class := fcase(
+  enrich_act & !enrich_inact, "activating",
+  enrich_inact & !enrich_act, "inactivating",
+  enrich_act & enrich_inact,  "both",
+  default = "none")]
+
+enrichment_dt_median[, `:=`(odds_ratio_allostery = NA_real_, fdr_enrich_allostery = NA_real_)]
+enrichment_dt_median[!is.na(or_act) | !is.na(or_inact),
+                     odds_ratio_allostery := pmax(or_act, or_inact, na.rm = TRUE)]
+enrichment_dt_median[!is.na(fdr_act) | !is.na(fdr_inact),
+                     fdr_enrich_allostery := pmin(fdr_act, fdr_inact, na.rm = TRUE)]
+
+other_info <- unique(all_ddg_a[, .(kinase, Pos_al, active_site, WT_AA, core_surf, rsasa, Region_Name)])
+enrichment_dt_median <- merge(enrichment_dt_median, other_info, by = c("kinase", "Pos_al"))
+
+enrichment_dt_median[is.na(net_allo_frac), net_allo_frac := 0]
+
+```
+
+# Region enrichment
+
+## Classification
+
+```{r allo-mut-classify}
+regions_sorted <- c("B1","B2","B3","HC","B4","B5","HD","HE","CL","AL","HF","FL","HG","HH","HI")
+
+allo_mut <- all_ddg_dist[active_site == "" & !is.na(Region_Name) & Region_Name != "" &
+                         Pos_al != 1 & is.finite(`mean_kcal/mol`)]
+
+allo_mut[, allo_class := fcase(
+  act_class == "inactivating", "inhibitory_allosteric",
+  act_class == "activating",   "activating_allosteric",
+  rep(TRUE, .N),               "no change")]
+
+allo_mut[, region_type := fcase(
+  grepl("^H", Region_Name), "Helix",
+  grepl("^B", Region_Name), "Beta strand",
+  rep(TRUE, .N),            "Loop")]
+allo_mut[, Region_Name := factor(Region_Name, levels = regions_sorted)]
+
+```
+
+## Inhibitory, per kinase
+
+```{r allo-mut-fisher-perkinase}
+combos <- unique(allo_mut[, .(kinase, feature_val = Region_Name)])
+
+allo_enrich_kin <- rbindlist(lapply(seq_len(nrow(combos)), function(i) {
+  k <- combos$kinase[i]; f <- combos$feature_val[i]
+  kd <- allo_mut[kinase == k]
+  inhib_in <- nrow(kd[Region_Name == f & allo_class == "inhibitory_allosteric"])
+  other_in <- nrow(kd[Region_Name == f & allo_class != "inhibitory_allosteric"])
+  inhib_bg <- nrow(kd[Region_Name != f & allo_class == "inhibitory_allosteric"])
+  other_bg <- nrow(kd[Region_Name != f & allo_class != "inhibitory_allosteric"])
+  ft <- fisher.test(matrix(c(inhib_in, inhib_bg, other_in, other_bg), nrow = 2))
+  data.table(kinase = k, Region_Name = f,
+             n_inhib = inhib_in, n_mut_region = inhib_in + other_in,
+             frac = round(inhib_in / (inhib_in + other_in), 3),
+             odds_ratio = unname(ft$estimate), pval = ft$p.value)
+}))
+allo_enrich_kin[, fdr := p.adjust(pval, method = "fdr"), by = kinase]
+allo_enrich_kin[, is_enriched := fdr < 0.1 & odds_ratio > 1]
+setorder(allo_enrich_kin, kinase, pval)
+print(allo_enrich_kin[, .(kinase, Region_Name, n_inhib, n_mut_region, frac,
+                          odds_ratio = round(odds_ratio, 2),
+                          fdr = signif(fdr, 3), is_enriched)])
+```
+
+## alphaC position 75
+
+```{r manuscript-aC-glu-split}
+fish_inhib <- function(dt, inset) {
+  a  <- sum(inset  & dt$allo_class == "inhibitory_allosteric")
+  b  <- sum(inset  & dt$allo_class != "inhibitory_allosteric")
+  cc <- sum(!inset & dt$allo_class == "inhibitory_allosteric")
+  dd <- sum(!inset & dt$allo_class != "inhibitory_allosteric")
+  ft <- fisher.test(matrix(c(a, cc, b, dd), nrow = 2))
+  c(or = unname(ft$estimate), p = ft$p.value)
+}
+aC_split <- rbindlist(lapply(kinases, function(k) {
+  dk  <- allo_mut[kinase == k]
+  p75 <- fish_inhib(dk, dk$Pos_al == 75)
+  dk2 <- dk[Pos_al != 75]
+  hc0 <- fish_inhib(dk2, dk2$Region_Name == "HC")
+  med75 <- median(all_ddg_a[kinase == k & Pos_al == 75, `mean_kcal/mol`], na.rm = TRUE)
+  data.table(kinase = k,
+             OR_pos75 = round(p75["or"], 2), p_pos75 = signif(p75["p"], 2),
+             med_ddGa_75 = round(med75, 2),
+             OR_HC_excl75 = round(hc0["or"], 2), p_HC_excl75 = signif(hc0["p"], 2))
+}))
+cat("== alpha-C inhibitory enrichment: position 75 alone vs rest of alpha-C (excluding 75) ==\n")
+print(aC_split)
+cat(sprintf("Position 75 alone: inhibitory OR range %.1f-%.1f ; median ddGa range %.2f-%.2f\n",
+            min(aC_split$OR_pos75), max(aC_split$OR_pos75),
+            min(aC_split$med_ddGa_75), max(aC_split$med_ddGa_75)))
+```
+
+## Inhibitory heatmap
+
+```{r allo-mut-region-heatmap, fig.width=3.2, fig.height=3.6}
+plot_dt <- copy(allo_enrich_kin)
+plot_dt[is.infinite(odds_ratio) | odds_ratio > 32, odds_ratio := 32]
+plot_dt[odds_ratio < (1/32), odds_ratio := 1/32]
+plot_dt[, log2_or := log2(odds_ratio)]
+plot_dt[, enrichment_status := fifelse(is_enriched, "Enriched", "None")]
+plot_dt[, sig_mark := fifelse(is_enriched, "*", "")]
+plot_dt[, Region_Name := factor(Region_Name, levels = regions_sorted)]
+
+region_labels <- c(
+  "B1"="beta*1","B2"="beta*2","B3"="beta*3","B4"="beta*4","B5"="beta*5",
+  "HC"="alpha*'C'","HD"="alpha*'D'","HE"="alpha*'E'","HF"="alpha*'F'",
+  "HG"="alpha*'G'","HH"="alpha*'H'","HI"="alpha*'I'",
+  "CL"="'CL'","AL"="'AL'","FL"="'FL'")
+
+if (!exists("theme_fig2")) {
+  theme_fig2 <- function(base = 12) {
+    theme_classic(base_size = base) %+replace%
+      theme(axis.text   = element_text(size = 12, color = "black"),
+            axis.title  = element_text(size = 11),
+            legend.text = element_text(size = 9),
+            legend.title= element_text(size = 10))
+  }
+}
+
+p_allo_region <- ggplot(plot_dt,
+                        aes(x = factor(kinase, levels = kinases), y = Region_Name)) +
+  geom_tile(aes(fill = log2_or), color = "grey80", linewidth = 0.5) +
+  geom_text(aes(label = sig_mark, color = enrichment_status),
+            size = 8, vjust = 0.75, fontface = "bold", show.legend = FALSE) +
+  scale_fill_gradient2(low = "grey70", mid = "white", high = "brown3",
+                       midpoint = 0, na.value = "grey95",
+                       name = "Log2(OR\ninhibitory\nallosteric)") +
+  scale_color_manual(values = c(Enriched = "brown3", None = "transparent")) +
+  scale_y_discrete(labels = function(x) parse(text = region_labels[as.character(x)])) +
+  scale_x_discrete(labels = relabel_jnk2) +
+  theme_fig2() +
+  labs(title = "", x = "", y = "") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 10),
+        axis.text.y = element_text(size = 12))
+
+
+ggsave(p_allo_region,
+       filename = paste0(output_dir_figS6, "FigS6D_region_inhibitory", format_img),
+       height = 3.6, width = 3.2, limitsize = FALSE)
+```
+
+## Activating, per kinase
+
+```{r activ-allo-mut-fisher-perkinase}
+combos <- unique(allo_mut[, .(kinase, feature_val = Region_Name)])
+
+allo_enrich_kin_act <- rbindlist(lapply(seq_len(nrow(combos)), function(i) {
+  k <- combos$kinase[i]; f <- combos$feature_val[i]
+  kd <- allo_mut[kinase == k]
+  act_in   <- nrow(kd[Region_Name == f & allo_class == "activating_allosteric"])
+  other_in <- nrow(kd[Region_Name == f & allo_class != "activating_allosteric"])
+  act_bg   <- nrow(kd[Region_Name != f & allo_class == "activating_allosteric"])
+  other_bg <- nrow(kd[Region_Name != f & allo_class != "activating_allosteric"])
+  ft <- fisher.test(matrix(c(act_in, act_bg, other_in, other_bg), nrow = 2))
+  data.table(kinase = k, Region_Name = f,
+             n_activ = act_in, n_mut_region = act_in + other_in,
+             frac = round(act_in / (act_in + other_in), 3),
+             odds_ratio = unname(ft$estimate), pval = ft$p.value)
+}))
+allo_enrich_kin_act[, fdr := p.adjust(pval, method = "fdr"), by = kinase]
+allo_enrich_kin_act[, is_enriched := fdr < 0.1 & odds_ratio > 1]
+setorder(allo_enrich_kin_act, kinase, pval)
+print(allo_enrich_kin_act[, .(kinase, Region_Name, n_activ, n_mut_region, frac,
+                              odds_ratio = round(odds_ratio, 2),
+                              fdr = signif(fdr, 3), is_enriched)])
+```
+
+## Activating heatmap
+
+```{r activ-allo-mut-region-heatmap, fig.width=3.2, fig.height=3.6}
+plot_dt_act <- copy(allo_enrich_kin_act)
+plot_dt_act[is.infinite(odds_ratio) | odds_ratio > 32, odds_ratio := 32]
+plot_dt_act[odds_ratio < (1/32), odds_ratio := 1/32]
+plot_dt_act[, log2_or := log2(odds_ratio)]
+plot_dt_act[, enrichment_status := fifelse(is_enriched, "Enriched", "None")]
+plot_dt_act[, sig_mark := fifelse(is_enriched, "*", "")]
+plot_dt_act[, Region_Name := factor(Region_Name, levels = regions_sorted)]
+
+p_allo_region_act <- ggplot(plot_dt_act,
+                            aes(x = factor(kinase, levels = kinases), y = Region_Name)) +
+  geom_tile(aes(fill = log2_or), color = "grey80", linewidth = 0.5) +
+  geom_text(aes(label = sig_mark, color = enrichment_status),
+            size = 8, vjust = 0.75, fontface = "bold", show.legend = FALSE) +
+  scale_fill_gradient2(low = "grey70", mid = "white", high = "blue3",
+                       midpoint = 0, na.value = "grey95",
+                       name = "Log2(OR\nactivating\nallosteric)") +
+  scale_color_manual(values = c(Enriched = "blue3", None = "transparent")) +
+  scale_y_discrete(labels = function(x) parse(text = region_labels[as.character(x)])) +
+  scale_x_discrete(labels = relabel_jnk2) +
+  theme_fig2() +
+  labs(title = "", x = "", y = "") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 10),
+        axis.text.y = element_text(size = 12))
+
+
+ggsave(p_allo_region_act,
+       filename = paste0(output_dir_figS6, "FigS6F_region_activating", format_img),
+       height = 3.6, width = 3.2, limitsize = FALSE)
+```
+
+# Activating substitutions shared across kinases
+
+```{r activ-substitution-sharing, fig.width=2.8, fig.height=3.0}
+act_out <- all_ddg_dist[act_class == "activating" & active_site == "" & mut_aa != "*"]
+sub_share <- act_out[, .(n_kin = uniqueN(kinase)), by = .(Pos_al, mut_aa)]
+share_dt <- sub_share[, .(N = .N), by = n_kin]
+share_dt <- merge(data.table(n_kin = 1:5), share_dt, by = "n_kin", all.x = TRUE)
+share_dt[is.na(N), N := 0]
+share_dt[, pct := round(100 * N / sum(N), 0)]
+message("distinct substitutions = ", sum(share_dt$N),
+        " ; single-kinase = ", share_dt[n_kin == 1, N],
+        " ; in all five = ", share_dt[n_kin == 5, N])
+
+p_sub_share <- ggplot(share_dt, aes(x = factor(n_kin), y = N)) +
+  geom_col(fill = "blue3", width = 0.78) +
+  geom_text(aes(label = N), vjust = -0.4, size = 3.5) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  theme_fig2() +
+  labs(x = "Number of kinases activated", y = "Distinct substitutions") +
+  theme(axis.text = element_text(size = 11))
+
+
+ggsave(p_sub_share,
+       filename = paste0(output_dir_figS6, "FigS6G_activating_sharing", format_img),
+       height = 3.0, width = 2.8, limitsize = FALSE)
+```
+
+# Lobe enrichment
+```{r activ-lobe-enrichment}
+lobe_dat <- all_ddg_dist[active_site == ""]
+lobe_dat[, lobe := fifelse(Pos_al <= 111, "N-lobe",
+                    fifelse(Pos_al < 115, "hinge", "C-lobe"))]
+lobe_dat <- lobe_dat[lobe %in% c("N-lobe", "C-lobe")]
+
+lobe_enr <- rbindlist(lapply(kinases, function(k) {
+  x <- lobe_dat[kinase == k]
+  x[, act := act_class == "activating"]
+  tab <- matrix(c(sum(x$lobe == "C-lobe" &  x$act), sum(x$lobe == "C-lobe" & !x$act),
+                  sum(x$lobe == "N-lobe" &  x$act), sum(x$lobe == "N-lobe" & !x$act)),
+                nrow = 2, byrow = TRUE)
+  ft <- fisher.test(tab)
+  data.table(kinase = k, OR = unname(ft$estimate),
+             lo = ft$conf.int[1], hi = ft$conf.int[2], p = ft$p.value,
+             n_act_C = tab[1, 1], n_C = sum(tab[1, ]),
+             n_act_N = tab[2, 1], n_N = sum(tab[2, ]))
+}))
+lobe_enr[, enriched := fifelse(OR > 1, "C-lobe", "N-lobe")]
+lobe_enr[, sig := p < 0.05]
+star <- function(p) ifelse(p < 0.001, "***", ifelse(p < 0.01, "**",
+                    ifelse(p < 0.05, "*", "")))
+lobe_enr[, lab_or := ifelse(OR >= 1, OR, 1 / OR)]
+lobe_enr[, lab_txt := sprintf("OR=%.1f%s", lab_or, star(p))]
+
+message("Activating mutations, C-lobe vs N-lobe (active site excluded):")
+print(lobe_enr[order(match(as.character(kinase), kinases)),
+               .(kinase, OR = round(OR, 2), lo = round(lo, 2), hi = round(hi, 2),
+                 p = signif(p, 2), enriched, n_act_C, n_C, n_act_N, n_N)])
+
+cap <- function(x) pmin(pmax(x, 1/32), 32)
+lobe_bar <- lobe_enr[, .(kinase, lobe = enriched, log2_or = abs(log2(cap(OR))), p)]
+lobe_bar[, kinase := factor(kinase, levels = kinases)]
+lobe_bar[, klab := factor(relabel_jnk2(as.character(kinase)), levels = relabel_jnk2(kinases))]
+lobe_bar[, lobe := factor(lobe, levels = c("N-lobe", "C-lobe"))]
+lobe_bar[, star_lab := fifelse(p < 0.05, star(p), "")]
+
+p_lobe <- ggplot(lobe_bar, aes(x = klab, y = log2_or, fill = lobe)) +
+  geom_col(width = 0.72, color = "black", linewidth = 0.25) +
+  geom_text(aes(y = log2_or + 0.15, label = star_lab), size = 4.2, fontface = "bold") +
+  scale_fill_manual(values = c("N-lobe" = "#a46a9d", "C-lobe" = "#d1b4ce"),
+                    name = "") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  theme_fig2() +
+  labs(x = "", y = "Log2(OR activating mutations)") +
+  theme(legend.position = "top",
+        axis.text.x = element_text(size = 11))
+
+
+ggsave(p_lobe,
+       filename = paste0(output_dir_figS6, "FigS6C_activating_lobes", format_img),
+       height = 2.5, width = 3, limitsize = FALSE)
+
+```
+
+# Major allosteric sites
+
+## Positions enriched in several kinases
+
+```{r position-enriched-across-kinases}
+pos_enr <- enrichment_dt_median[active_site == "" & !is.na(Region_Name) &
+                                Region_Name != "" & Pos_al != 1]
+pos_enr[, is_inhib_pos := enrich_inact]
+
+pos_count <- pos_enr[, .(
+  n_kin_allo   = sum(enrich_allostery),
+  n_kin_inhib  = sum(is_inhib_pos),
+  kinases_allo = paste(sort(as.character(kinase[enrich_allostery])), collapse = ","),
+  region       = paste(unique(as.character(Region_Name)), collapse = "/"),
+  WT_by_kin    = paste(sort(unique(paste0(kinase, ":", WT_AA))), collapse = " ")
+), by = Pos_al]
+setorder(pos_count, -n_kin_allo, -n_kin_inhib)
+
+message("Positions allosteric-enriched in >= 3 kinases:")
+print(pos_count[n_kin_allo >= 3, .(Pos_al, n_kin_allo, n_kin_inhib, region, kinases_allo, WT_by_kin)])
+```
+
+## Site counts
+
+```{r manuscript-major-site-counts}
+.ms <- enrichment_dt_median[active_site == ""]
+cat(sprintf("Major allosteric sites: %d alignment positions enriched in >=1 kinase\n",
+            uniqueN(.ms[enrich_allostery == TRUE, Pos_al])))
+cat(sprintf("  inactivating sites: %d ; activating sites: %d\n",
+            uniqueN(.ms[enrich_inact == TRUE, Pos_al]),
+            uniqueN(.ms[enrich_act   == TRUE, Pos_al])))
+
+act_sites <- .ms[enrich_act == TRUE, .(n_kin = uniqueN(kinase), kinases = paste(sort(unique(kinase)), collapse = ",")), by = Pos_al]
+cat(sprintf("Activating sites enriched in a single kinase: %d of %d\n", act_sites[n_kin == 1, .N], nrow(act_sites)))
+print(act_sites[n_kin > 1][order(Pos_al)])
+switch_pos <- merge(.ms[enrich_act == TRUE, .(Pos_al, kin_act = kinase)],
+                    .ms[enrich_inact == TRUE, .(Pos_al, kin_inact = kinase)],
+                    by = "Pos_al", allow.cartesian = TRUE)[kin_act != kin_inact, sort(unique(Pos_al))]
+cat("Positions activating in one kinase and inhibitory in another:", switch_pos, "\n")
+```
+
+## alphaE and SH3 contact
+
+```{r manuscript-aE-sh3-enrichment}
+for (k in c("SRC", "FGR")) {
+  ae  <- enrichment_dt_median[kinase == k & Pos_al %in% 133:151]
+  aea <- ae[enrich_act == TRUE]
+  cat(sprintf("%s alpha-E (Pos_al 133-151): %d/%d positions activating-enriched%s\n",
+      k, nrow(aea), nrow(ae),
+      if (nrow(aea)) sprintf(" (OR %.1f-%.1f)", min(aea$or_act), max(aea$or_act)) else ""))
+}
+fgr46 <- enrichment_dt_median[kinase == "FGR" & Pos_al == 46]
+cat(sprintf("FGR SH3-contact position 46: activating OR = %.1f (fdr %.2g), median ddGa = %.2f\n",
+            fgr46$or_act, fgr46$fdr_act, fgr46$pos_median))
+```
+
+## JNK2 D-recruitment site
+
+```{r manuscript-jnk2-drecruitment}
+for (p in c(172, 341)) {
+  jd <- enrichment_dt_median[kinase == "MAPK9" & Pos_al == p]
+  cat(sprintf("JNK2 position %d: inactivating OR = %.1f (fdr %.2g), median ddGa = %.2f\n",
+              p, jd$or_inact, jd$fdr_inact, jd$pos_median))
+}
+```
+
+## Cross-kinase correlation
+
+```{r manuscript-ddga-crosskinase-correlation}
+subs_median_a <- all_ddg_a[, .(median = median(`mean_kcal/mol`, na.rm = TRUE)),
+                           by = .(Pos_al, kinase, core_surf)]
+wa <- dcast(subs_median_a, Pos_al ~ factor(kinase, levels = kinases), value.var = "median",
+            fun.aggregate = function(x) median(x, na.rm = TRUE))
+kcols_a <- intersect(kinases, names(wa))
+ws <- dcast(subs_median_a[core_surf == "Surface"],
+            Pos_al ~ factor(kinase, levels = kinases), value.var = "median",
+            fun.aggregate = function(x) median(x, na.rm = TRUE))
+cor_s <- cor(ws[, ..kcols_a], use = "pairwise.complete.obs", method = "pearson")
+cat("== Surface-only position-median cross-kinase Pearson r of ddGa ==\n")
+print(round(cor_s, 2))
+cat(sprintf("Surface SRC-FGR = %.2f ; SRC-ZAK = %.2f ; SRC-TSSK2 = %.2f ; SRC-JNK2(MAPK9) = %.2f\n",
+            cor_s["SRC", "FGR"], cor_s["SRC", "ZAK"], cor_s["SRC", "TSSK2"], cor_s["SRC", "MAPK9"]))
+```
+
+
+## Major-site heatmap
+
+```{r}
+cap_val <- quantile(abs(enrichment_dt_median$pos_median), probs = 0.98, na.rm = TRUE)
+
+enrichment_dt_median[, pos_group := ifelse(Pos_al <= 127, "First", ifelse(Pos_al <= 252, "Second", "Third"))]
+
+
+
+plot_all_predicted_data_count <- unique(enrichment_dt_median[enrich_allostery == TRUE & active_site=="",
+                                                      .(pos_group, Pos_al, kinase)])
+count_sig_pos <- plot_all_predicted_data_count[, .(N = .N, pos_group = unique(pos_group)), by = Pos_al]
+count_sig_pos[, count_category := ifelse(N > 2, "high", "low")]
+
+
+region_colors <- c(
+  B1="lightblue", B2="lightblue", B3="lightblue", B4="lightblue", B5="lightblue",
+  HC="tomato2", HD="tomato2", HE="tomato2", HF="tomato2", HG="tomato2", HH="tomato2", HI="tomato2",
+  AL="lightgreen", CL="yellow2", FL="yellow2"
+)
+
+dt_region_plot <- enrichment_dt_median[kinase == "TSSK2"]
+region_labels <- dt_region_plot[, .(Pos_al = round(median(as.numeric(Pos_al)))), by = .(Region_Name)]
+region_labels[, kinase := "Region\nLabel"]
+region_labels[, pos_group := ifelse(Pos_al <= 127, "First", ifelse(Pos_al <= 252, "Second", "Third"))]
+
+template_dt <- data.table(Pos_al = 1:378, kinase = "TSSK2")
+src_full <- merge(template_dt, dt_region_plot[kinase == "TSSK2"], by = c("Pos_al", "kinase"), all.x = TRUE)
+src_full[, pos_group := ifelse(Pos_al <= 127, "First", ifelse(Pos_al <= 252, "Second", "Third"))]
+
+
+discrete_ranges <- list(
+  "First"  = as.character(1:127),
+  "Second" = as.character(127:252),
+  "Third"  = as.character(252:378)
+)
+range_meta <- list("First" = c(1, 127), "Second" = c(127, 252), "Third" = c(252, 378))
+
+
+get_discrete_breaks <- function(start, end) {
+  as.character(seq(from = start, to = end, by = 10))
+}
+
+
+combined_plots <- list()
+plot_data <- enrichment_dt_median[Pos_al !=1]
+
+for (grp in c("First", "Second", "Third")) {
+
+  current_limits <- discrete_ranges[[grp]]
+  current_breaks <- get_discrete_breaks(range_meta[[grp]][1], range_meta[[grp]][2])
+
+  dt_main   <- plot_data[pos_group == grp]
+  dt_counts <- count_sig_pos[pos_group == grp]
+  dt_strip  <- src_full[pos_group == grp]
+  labels_strip <- region_labels[pos_group == grp]
+
+  p_main <- ggplot(dt_main, aes(x = as.factor(Pos_al), y = factor(kinase, levels = rev(kinases)))) +
+
+    geom_tile(aes(fill = pos_median), color = "white", size = 0.1) +
+
+
+    geom_tile(data = dt_main[enrich_inact == TRUE],
+              color = "red", size = 1.2, fill = NA) +
+    geom_tile(data = dt_main[enrich_act == TRUE],
+              color = "cyan", size = 1.2, fill = NA) +
+    geom_text(data = dt_counts,
+              aes(x = as.factor(Pos_al),
+                  y = length(kinases) + 0.8,
+                  label = N,
+                  color = count_category),
+              inherit.aes = FALSE, size = 5, fontface = "bold") +
+    geom_text(aes(label = WT_AA),color="black", size = 4) +
+    scale_color_manual(values = c("none" = "black",
+                                  "high"= "brown1",
+                                  "low"= "grey60" )
+                       ) +
+    geom_tile(data = unique(dt_main[active_site!="",.(kinase,Pos_al)]),
+              fill = "grey50", alpha = 0.7) +
+
+
+    scale_fill_gradientn(
+      colours = c("blue3", "grey90", "brown3"),
+      values = scales::rescale(c(-cap_val, 0, cap_val)),
+      limits = c(-cap_val, cap_val),
+      oob = scales::squish,
+      name = "Median ddG"
+    ) +
+    scale_x_discrete(
+      expand = c(0, 0),
+      limits = current_limits,
+      breaks = current_breaks
+    ) +
+    scale_y_discrete(expand = expansion(mult = c(0, 0.3)), labels = relabel_jnk2) +
+
+    theme_minimal() +
+    theme(
+      axis.ticks.y = element_blank(),
+      axis.ticks.x.top = element_line(),
+      panel.grid = element_blank(),
+      legend.position = "none",
+      axis.text.y = element_text(size = 15),
+      axis.text.x = element_blank(),
+      axis.title = element_blank(),
+      strip.text = element_blank()
+    )
+
+  p_strip <- ggplot(dt_strip) +
+    geom_tile(aes(x = as.factor(Pos_al), y = "Region", fill = Region_Name)) +
+
+    geom_text(data = labels_strip,
+              aes(x = as.factor(Pos_al), y = "Region", label = fmt_region(Region_Name)),
+              vjust = 0.5, hjust = 0.5, size = 6, fontface = "bold", parse = TRUE) +
+
+    scale_fill_manual(values = region_colors, na.value = "white") +
+    theme_classic() +
+    theme(
+      axis.ticks = element_blank(),
+      axis.line.y = element_blank(),
+      legend.position = "none",
+      axis.text.y = element_text(size = 15),
+      axis.text.x = element_text(size = 12, angle = 90, vjust = 0.5, hjust = 1),
+      strip.text = element_blank(),
+      axis.title = element_blank()
+    ) +
+    scale_x_discrete(
+      expand = c(0, 0),
+      limits = current_limits,
+      breaks = current_breaks
+    )
+
+  pair <- p_main / p_strip + plot_layout(heights = c(7, 1))
+  combined_plots[[grp]] <- wrap_elements(pair)
+}
+
+final_plot <- combined_plots[["First"]] /
+              combined_plots[["Second"]] /
+              combined_plots[["Third"]]
+
+ggsave(
+  plot = final_plot,
+  filename = paste0(output_dir_figS7, "FigS7A_major_sites_heatmap", format_img),
+  height = 9,
+  width = 22,
+  limitsize = FALSE
+)
+
+```
+
+
+## log2 OR for export
+```{r}
+enrichment_dt_median[, log2_OR := log2(odds_ratio_allostery)]
+
+enrichment_dt_median[is.infinite(log2_OR), log2_OR := NA]
+```
+
+
+# ChimeraX: enriched positions
+
+
+```{r}
+sig_residues_all <- unique(enrichment_dt_median[enrich_allostery == TRUE, .(kinase, residue = Pos, pos_median, enrich_act, enrich_inact)])
+
+unique_kinases <- unique(sig_residues_all$kinase)
+
+for (k in unique_kinases) {
+  sig_residues <- sig_residues_all[kinase == k]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: alloenrich",
+    "recipient: residues",
+    paste0("\t:",sig_residues$residue, "\t",sig_residues$pos_median)
+  )
+
+  file_name <- paste0(output_dir_chimera, "allostery_enrichment_", k, ".defattr")
+
+  writeLines(chimerax_lines, file_name)
+}
+```
+
+## Counts per kinase
+
+```{r}
+global_counts <- sig_residues_all[, .(
+	inact = sum(enrich_inact, na.rm = TRUE),
+	act = sum(enrich_act, na.rm = TRUE),
+	total_positions = .N
+)]
+
+print(global_counts)
+
+kinase_counts <- sig_residues_all[, .(
+	inact = sum(enrich_inact, na.rm = TRUE),
+	act = sum(enrich_act, na.rm = TRUE),
+	total_positions = .N
+), by = kinase]
+
+print(kinase_counts)
+```
+
+
+# Surface enrichment
+```{r}
+dt_hotspots_count <- unique(enrichment_dt_median[enrich_allostery == TRUE & !is.na(rsasa),
+													 .(Pos_al, kinase, rsasa, core_surf)])
+
+count_sig_pos <- dt_hotspots_count[, .(N = .N, rsasa = rsasa, kinase = kinase, core_surf = core_surf),
+									   by = Pos_al]
+setnames(count_sig_pos, "N", "N_prot")
+
+
+background_counts <- count_sig_pos[, .N, by = core_surf]
+setnames(background_counts, "N", "background_N")
+
+
+enriched_counts <- count_sig_pos[N_prot > 0, .N, by = .(N_prot, core_surf)]
+setnames(enriched_counts, "N", "enriched_N")
+
+all_combos <- CJ(N_prot = unique(enriched_counts$N_prot),
+				 core_surf = unique(background_counts$core_surf))
+
+enriched_counts <- enriched_counts[all_combos, on = .(N_prot, core_surf)]
+enriched_counts[is.na(enriched_N), enriched_N := 0]
+
+
+counts <- merge(enriched_counts, background_counts, by = "core_surf", suffixes = c("_group", "_bg"))
+counts[, other_N := background_N - enriched_N]
+
+
+
+res <- counts[
+	, {
+		mat <- matrix(c(
+			enriched_N[core_surf == "Surface"],
+			enriched_N[core_surf == "Core"],
+			other_N[core_surf == "Surface"],
+			other_N[core_surf == "Core"]
+		), nrow = 2)
+
+		ft <- fisher.test(mat)
+
+		total_enriched <- sum(enriched_N)
+		total_background <- sum(background_N)
+
+		data.table(
+			odds_ratio = ft$estimate,
+			pvalue = ft$p.value,
+			N_enriched = total_enriched,
+			surface_in_group = enriched_N[core_surf == "Surface"],
+			enrichment_ratio = (enriched_N[core_surf == "Surface"] / total_enriched) /
+							   (background_N[core_surf == "Surface"] / total_background)
+		)
+	},
+	by = N_prot
+]
+
+res[, fdr := p.adjust(pvalue, method = "fdr")]
+
+print(res)
+```
+
+## Surface allosteric positions
+
+```{r manuscript-surface-allosteric-effects}
+surf_all <- enrichment_dt_median[core_surf == "Surface" & active_site == ""]
+surf_cnt <- surf_all[, .(activating   = sum(pos_median < -0.2, na.rm = TRUE),
+                         inactivating = sum(pos_median >  0.2, na.rm = TRUE),
+                         n = .N), by = kinase]
+cat("== Surface allosteric positions per kinase (activating vs inactivating) ==\n")
+print(surf_cnt[match(kinases, kinase)])
+strong_all <- enrichment_dt_median[active_site == ""]
+strong_pos <- c(220, 221, 217, 248, 179, 184, 192, 198, 200, 201)
+cat("\n== Strongest surface positions cited in the text (per-kinase median ddGa) ==\n")
+print(strong_all[Pos_al %in% strong_pos,
+               .(kinase, Pos_al, Region_Name, WT_AA, median_ddGa = round(pos_median, 2))][
+               order(Pos_al, kinase)])
+cat(sprintf("ZAK activation-loop (AL) positions: max median ddGa = %.2f (Pos_al %d)\n",
+            max(strong_all[kinase == "ZAK" & Region_Name == "AL", pos_median], na.rm = TRUE),
+            strong_all[kinase == "ZAK" & Region_Name == "AL"][which.max(pos_median), Pos_al]))
+```
+
+## Shared vs kinase-specific sites
+
+```{r shared_vs_specific_coresurf}
+mas <- copy(count_sig_pos)
+mas[, group := ifelse(N_prot >= 2, "shared", "kinase-specific")]
+
+res_tab <- dcast(mas[, .N, by = .(group, core_surf)], group ~ core_surf, value.var = "N", fill = 0)
+ft_res  <- fisher.test(as.matrix(res_tab[, .(Core, Surface)]))
+cat("== residue level (enriched Pos_al x kinase) ==\n"); print(res_tab)
+cat(sprintf("shared: %d residues (%d core / %d surface, %.0f%% surface) ; kinase-specific: %d residues (%d core / %d surface, %.0f%% surface)\n",
+    res_tab[group=="shared", Core+Surface], res_tab[group=="shared", Core], res_tab[group=="shared", Surface],
+    100*res_tab[group=="shared", Surface/(Core+Surface)],
+    res_tab[group=="kinase-specific", Core+Surface], res_tab[group=="kinase-specific", Core], res_tab[group=="kinase-specific", Surface],
+    100*res_tab[group=="kinase-specific", Surface/(Core+Surface)]))
+cat(sprintf("OR (kinase-specific surface vs shared surface) = %.2f ; FET p = %.3g\n",
+    1/ft_res$estimate, ft_res$p.value))
+```
+
+## Plot
+
+```{r}
+res[, log2_OR := log2(odds_ratio)]
+
+floor_limit <- -3
+ceiling_limit <- 3
+
+res[is.infinite(log2_OR) & log2_OR < 0, log2_OR := floor_limit]
+
+res[is.infinite(log2_OR) & log2_OR > 0, log2_OR := ceiling_limit]
+
+res[, sig := pvalue < 0.1]
+
+enrichment_plot_core <- ggplot(res, aes(x = factor(N_prot), y = log2_OR)) +
+  geom_col(width = 0.8, aes(fill = factor(N_prot))) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.6) +
+  geom_text(
+    data = res[sig == TRUE],
+    aes(label = "*"),
+    vjust = 0, size = 6, color = "black"
+  ) +
+  labs(
+    x = "Number of kinases sharing hotspot (N)",
+    y = "Log2(OR surface enrichment)",
+    fill = ""
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.1))) +
+
+  scale_fill_manual(values=c("#f4db8a","#ecb5fd","#e07aff","#ae2ed5","#691883"))+
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text = element_text(color = "black")
+  )
+
+enrichment_plot_core
+ggsave(enrichment_plot_core,filename =paste0(output_dir_figS7,"FigS7B_surface_enrichment",format_img),height = 3,width = 4,limitsize = FALSE)
+
+
+```
+
+## ChimeraX: shared sites
+```{r}
+dt_hotspots_pos <- unique(enrichment_dt_median[, .(kinase,Pos,Pos_al,pos_median)])
+
+sig_residues_all<-merge(dt_hotspots_pos,count_sig_pos,by=c("kinase","Pos_al"))
+unique_kinases <- unique(sig_residues_all$kinase)
+
+for (k in unique_kinases) {
+  sig_residues <- sig_residues_all[kinase == k]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: ConsAllo",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$N_prot)
+  )
+
+  file_name <- paste0(output_dir_chimera, "conserv_allostery_significant_residues_", k, ".defattr")
+  writeLines(chimerax_lines, file_name)
+}
+```
+# Clustering by contacts
+
+## Hotspot positions
+
+```{r}
+dt_hotspots_pos <- unique(enrichment_dt_median[, .(kinase,Pos,Pos_al,pos_median)])
+
+dist_dt <- fread(paste0(data_struct, "minimum_residuedistances_pairwise.txt"))
+
+dist_dt <- dist_dt[, .(kinase, Pos1, Pos2, scHA_ca)]
+dist_dt[, scHA_ca := as.numeric(scHA_ca)]
+
+
+get_kinase_dist_matrix <- function(kinase_name, full_dist_dt) {
+	k_dt <- full_dist_dt[kinase == kinase_name]
+
+	if (nrow(k_dt) == 0) return(NULL)
+
+	u_pos <- sort(unique(c(k_dt$Pos1, k_dt$Pos2)))
+
+	mat <- matrix(NA, nrow = length(u_pos), ncol = length(u_pos), dimnames = list(u_pos, u_pos))
+
+	mat[cbind(as.character(k_dt$Pos1), as.character(k_dt$Pos2))] <- k_dt$scHA_ca
+	mat[cbind(as.character(k_dt$Pos2), as.character(k_dt$Pos1))] <- k_dt$scHA_ca
+
+	return(mat)
+}
+```
+
+## Contact statistics
+
+```{r}
+calc_adaptive_contact_stats <- function(
+  sub_res, all_res, dist_matrix,
+  min_n = 3,
+  n_sims = 10000,
+  contact_threshold = 5.0
+) {
+
+  valid_sub <- as.character(sub_res[as.character(sub_res) %in% rownames(dist_matrix)])
+  valid_all <- as.character(all_res[as.character(all_res) %in% rownames(dist_matrix)])
+
+  N_obs <- length(valid_sub)
+
+  if (N_obs < min_n) {
+    return(list(p_value = NA_real_, z_score = NA_real_, avg_contacts = NA_real_, N_used = N_obs))
+  }
+
+  get_avg_internal_contacts <- function(residues) {
+    sub_mat <- dist_matrix[residues, residues, drop = FALSE]
+
+    is_contact <- (sub_mat < contact_threshold)
+    diag(is_contact) <- FALSE
+
+    return(sum(is_contact, na.rm = TRUE) / length(residues))
+  }
+
+  obs_contacts <- get_avg_internal_contacts(valid_sub)
+
+  null_vals <- replicate(n_sims, {
+    samp <- sample(valid_all, N_obs, replace = FALSE)
+    get_avg_internal_contacts(samp)
+  })
+
+  null_vals <- null_vals[!is.na(null_vals)]
+
+  p_val <- mean(null_vals >= obs_contacts)
+
+  z_score <- (obs_contacts - mean(null_vals)) / sd(null_vals)
+
+  list(
+    p_value = p_val,
+    z_score = z_score,
+    avg_contacts = obs_contacts,
+    N_used = N_obs
+  )
+}
+
+
+results_list <- lapply(kinases, function(k) {
+
+  k_matrix <- get_kinase_dist_matrix(k, dist_dt)
+  if (is.null(k_matrix)) return(NULL)
+
+  sub_residues <- dt_hotspots_pos[Pos_al %in% count_sig_pos[N_prot ==1 & kinase == k, Pos_al]& kinase == k, Pos]
+
+  all_residues <- unique(all_predicted_data[kinase == k, Pos])
+
+  set.seed(123)
+
+  stats <- calc_adaptive_contact_stats(
+    sub_residues,
+    all_residues,
+    k_matrix,
+    min_n = 5,
+    n_sims = 10000,
+    contact_threshold = 8.0
+  )
+
+  if (is.na(stats$p_value)) return(NULL)
+
+  data.table(
+    kinase = k,
+    n_hotspots = stats$N_used,
+
+    avg_internal_contacts = round(stats$avg_contacts, 2),
+
+    z_score = round(stats$z_score, 2),
+    p_value = stats$p_value
+  )
+})
+
+contact_results <- rbindlist(results_list)
+
+contact_results[, is_dense_cluster := fifelse(p_value < 0.1, TRUE, FALSE)]
+
+setorder(contact_results, -z_score)
+
+cat("== Clustering of single-kinase major allosteric sites ==\n")
+print(contact_results)
+
+results_list_all <- lapply(kinases, function(k) {
+  k_matrix <- get_kinase_dist_matrix(k, dist_dt)
+  if (is.null(k_matrix)) return(NULL)
+  sub_residues <- dt_hotspots_pos[Pos_al %in% count_sig_pos[kinase == k, Pos_al] & kinase == k, Pos]
+  all_residues <- unique(all_predicted_data[kinase == k, Pos])
+  set.seed(123)
+  stats <- calc_adaptive_contact_stats(sub_residues, all_residues, k_matrix,
+                                       min_n = 5, n_sims = 10000, contact_threshold = 8.0)
+  if (is.na(stats$p_value)) return(NULL)
+  data.table(kinase = k, n_hotspots = stats$N_used,
+             avg_internal_contacts = round(stats$avg_contacts, 2),
+             z_score = round(stats$z_score, 2), p_value = stats$p_value)
+})
+contact_results_all <- rbindlist(results_list_all)
+contact_results_all[, is_dense_cluster := fifelse(p_value < 0.1, TRUE, FALSE)]
+setorder(contact_results_all, -z_score)
+
+cat("== Clustering of all major allosteric sites ==\n")
+print(contact_results_all)
+```
+
+# Major-site ddGa heatmap
+
+```{r}
+enrichment_hotspot<-enrichment_dt_median
+
+dt_hotspots_count<-unique(enrichment_hotspot[enrich_allostery == TRUE&!is.na(rsasa),
+                                     .(Pos_al,kinase,enrich_allostery,enrich_act,enrich_inact)])
+
+count_sig_pos <- dt_hotspots_count[,.(N = .N,kinase=kinase),
+                                     by = Pos_al]
+
+count_sig_pos_unique<-unique(count_sig_pos[,.(Pos_al,N)])
+
+pos_enriched<-unique(enrichment_hotspot[enrich_allostery==TRUE,Pos_al])
+
+
+dt_base <- all_ddg_a[Pos_al %in% pos_enriched]
+
+
+dt_plot<-merge(dt_base, dt_hotspots_count,by=c("Pos_al","kinase"),all.x=TRUE)
+dt_plot<-merge(dt_plot,count_sig_pos_unique,by=c("Pos_al"))
+
+p_hatmap_hotspots <- ggplot(dt_plot) +
+	geom_tile(aes(
+		x = factor(kinase, levels = kinases),
+		y = factor(mut_aa, levels = all_aa),
+		fill = `mean_kcal/mol`
+	)) +
+	scale_fill_gradientn(
+		colours = c("blue3", "grey90", "brown3"),
+		values = scales::rescale(c(-cap_val, 0, cap_val)),
+		limits = c(-cap_val, cap_val),
+		guide = "colorbar",
+		oob = scales::squish
+	) +
+	geom_point(
+		data = dt_plot[enrich_act==TRUE],
+		aes(x = factor(kinase, levels = kinases),
+			y = length(all_aa) + 0.3),
+		inherit.aes = FALSE,
+		size = 4, color="lightblue"
+	)+
+	geom_point(
+		data = dt_plot[enrich_inact==TRUE],
+		aes(x = factor(kinase, levels = kinases),
+			y = length(all_aa) + 0.3),
+		inherit.aes = FALSE,
+		size = 4, color="red"
+	)+
+
+	facet_wrap(
+		N~factor(Pos_al), drop=TRUE, ncol=22
+	) +
+
+	theme_classic() +
+	theme(
+		axis.text.y = element_text(color=color_axis_y, size=12),
+		axis.text.x = element_text(size = 12, angle = 90, vjust = 0.5, hjust = 1),
+		strip.text = element_text(size = 14, face = "bold"),
+	) +
+	labs(x = "", y = "", fill=expression(Delta*Delta*G[a]))+
+	theme(legend.title = element_text(size = 14, face = "bold"), legend.text = element_text(size = 11))+
+	scale_y_discrete(expand = expansion(mult = c(0, 0.1)))+
+	scale_x_discrete(labels = relabel_jnk2)
+
+
+ggsave(p_hatmap_hotspots,filename =paste0(output_dir_fig5,"Fig5C_major_sites_ddGa",format_img),height = 20,width = 20,limitsize = FALSE)
+
+```
+# Save enrichment table
+```{r}
+fwrite(enrichment_dt_median,file=paste0(results_path,"allostery_enrichment_dt.csv"))
+```
+
+# Spines
+## C-spine
+```{r}
+dt_hotspots_count<-unique(enrichment_hotspot[enrich_allostery == TRUE&!is.na(rsasa),
+                                     .(Pos_al,kinase,enrich_allostery,enrich_act,enrich_inact)])
+all_allostery<-merge(all_ddg_a,dt_hotspots_count,all.x=TRUE)
+spines<-all_allostery[Functional_feature%in%c("R-spine","C-spine")]
+
+
+summary_rows <- unique(spines[assay == "Activity",
+                                .(Pos_al, WT_AA,kinase,assay,Functional_feature,Region_Name,enrich_allostery, `mean_kcal/mol` = pos_median)])
+
+summary_rows[, mut_aa := "mean"]
+spines_average <- rbind(spines, summary_rows, fill = TRUE)
+aa_levels_with_mean <- c("mean",rev(all_aa))
+
+
+spines_hotspots<-unique(all_allostery[enrich_allostery == TRUE&Pos_al%in%spines$Pos_al,
+                                     .(Pos_al,kinase,Functional_feature,pos_median,active_site,enrich_act,enrich_inact)])
+```
+
+## Spine residues
+
+```{r manuscript-spine-exact-residues}
+spine_pm <- all_ddg[, .(med = median(`mean_kcal/mol`, na.rm = TRUE)),
+                    by = .(kinase, Pos_al, assay, Functional_feature)]
+spine_pos <- all_ddg[, .(med = median(`mean_kcal/mol`, na.rm = TRUE)), by = .(Pos_al, assay)]
+rspine_pos <- c(79, 90, 159, 180)
+cat(sprintf("R-spine residues (aligned %s): median ddGa = %.2f ; median ddGf = %.2f\n",
+    paste(rspine_pos, collapse = ","),
+    median(spine_pos[assay == "Activity" & Pos_al %in% rspine_pos, med], na.rm = TRUE),
+    median(spine_pos[assay == "Folding"  & Pos_al %in% rspine_pos, med], na.rm = TRUE)))
+cspine_all <- sort(unique(spine_pm[Functional_feature == "C-spine", Pos_al]))
+cspine_atp <- c(41, 54, 168)
+cat(sprintf("C-spine ATP-contact residues (aligned %s): median ddGa = %.2f\n",
+    paste(cspine_atp, collapse = ","),
+    median(spine_pos[assay == "Activity" & Pos_al %in% cspine_atp, med], na.rm = TRUE)))
+for (p in c(122, 167)) {
+  cat(sprintf("JNK2 (MAPK9) C-spine position %d: median ddGa = %.2f\n", p,
+      median(spine_pm[assay == "Activity" & kinase == "MAPK9" & Pos_al == p, med], na.rm = TRUE)))
+}
+cspine_other <- setdiff(cspine_all, cspine_atp)
+cat(sprintf("Other C-spine residues (aligned %s): median ddGa = %.2f ; median ddGf = %.2f\n",
+    paste(cspine_other, collapse = ","),
+    median(spine_pos[assay == "Activity" & Pos_al %in% cspine_other, med], na.rm = TRUE),
+    median(spine_pos[assay == "Folding"  & Pos_al %in% cspine_other, med], na.rm = TRUE)))
+```
+
+
+## ChimeraX: C-spine
+
+```{r}
+as_residues_all_conserv<-unique(spines[Functional_feature=="C-spine",.(Pos,kinase,pos_median)])
+
+for (k in unique_kinases) {
+  sig_residues <- as_residues_all_conserv[kinase == k]
+  sig_residues<-sig_residues[!is.na(pos_median)]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: Cspine",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$pos_median)
+  )
+
+  file_name <- paste0(output_dir_chimera, "Cspine_", k, ".defattr")
+
+  writeLines(chimerax_lines, file_name)
+}
+```
+## ChimeraX: R-spine
+
+
+```{r}
+as_residues_all_conserv<-unique(spines[Functional_feature=="R-spine",.(Pos,kinase,pos_median)])
+
+
+for (k in unique_kinases) {
+  sig_residues <- as_residues_all_conserv[kinase == k]
+  sig_residues<-sig_residues[!is.na(pos_median)]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: Rspine",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$pos_median)
+  )
+
+  file_name <- paste0(output_dir_chimera, "Rspine_", k, ".defattr")
+
+  writeLines(chimerax_lines, file_name)
+}
+```
+
+## Activity heatmap
+```{r}
+cap_val <- quantile(abs(spines_average$pos_median), probs = 0.98, na.rm = TRUE)
+spines[, text_color := fifelse(!is.na(ATP) & ATP == "ATP contact",
+                                           "ATP","none")]
+
+p_hatmap_spine_mean <- ggplot(spines,
+                                    aes(x = as.factor(Pos_al),
+                                        y = factor(kinase, levels=rev(kinases)),
+                                        fill = pos_median)) +
+  geom_tile(color = "white", size = 0.3) +
+    theme_classic() +
+  scale_fill_gradientn(
+    colours = c("blue3", "grey90", "brown3"),
+    values = scales::rescale(c(-cap_val, 0, cap_val)),
+    limits = c(-cap_val, cap_val),
+    guide = "colorbar",
+    oob = scales::squish
+  )+
+  geom_point(
+    data = unique(spines[active_site != "", .(Pos_al, Functional_feature)]),
+    aes(x = as.factor(Pos_al), y = "SRC"),
+    shape = 16, fill = "grey50", color = "grey50", size = 5,
+    position = position_nudge(y = 0.75),
+    inherit.aes = FALSE
+  ) +
+  geom_tile(data = spines[enrich_inact == TRUE],
+            color = "red", size = 1.5, fill = NA) +
+geom_tile(data = spines[enrich_act == TRUE],
+            color = "cyan", size = 1.5, fill = NA) +
+geom_text(
+  data = spines[text_color == "ATP"],
+  aes(x = as.factor(Pos_al), y = kinase, label = WT_AA),
+  color = "#ffe500", size = 5
+) +
+geom_text(
+  data = spines[text_color == "none"],
+  aes(x = as.factor(Pos_al), y = kinase, label = WT_AA),
+  color = "black", size = 5
+)+
+    labs(x = "", y = "", fill =expression(Delta*Delta*G[a]))+
+  theme(
+    axis.ticks.y = element_blank(),
+    axis.ticks.x.top = element_line(),
+    legend.title = element_text(size = 15, face = "bold"),
+    legend.text = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title = element_text(size = 11),
+    axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+    strip.text =  element_text(size = 15, face = "bold")
+  )+
+  scale_y_discrete(expand = expansion(add = c(0, 1.05)), labels = relabel_jnk2) +
+  facet_grid2(
+    ~factor(Functional_feature),
+    scales = "free_x",
+    space = "free_x",
+    strip = strip_themed(
+      background_x = elem_list_rect(fill = c("#009548", "#b9dca6"))
+    )
+  )
+
+
+
+ggsave(p_hatmap_spine_mean,filename =paste0(output_dir_fig3,"Fig3E_spines_ddGa",format_img),height = 3.1,width = 6,limitsize = FALSE)
+```
+
+
+## Folding heatmap
+```{r}
+all_ddg_f<-all_ddg[assay=="Folding",]
+
+ddg_mean_f <- all_ddg_f[, .(pos_mean = weighted.mean(`mean_kcal/mol`, `std_kcal.mol`^-2, na.rm = TRUE)),
+                                by = .(Pos, kinase, assay,Pos_al)]
+all_ddg_f <- merge(all_ddg_f, ddg_mean_f,
+                  by = c("Pos", "kinase", "assay","Pos_al"),
+                  all.x = TRUE)
+
+
+ddg_median_f <- all_ddg_f[, .(pos_median = median(`mean_kcal/mol`, na.rm = TRUE)),
+                                 by = .(Pos, kinase, assay,Pos_al)]
+all_ddg_f <- merge(all_ddg_f, ddg_median_f,
+                   by = c("Pos", "kinase", "assay","Pos_al"),
+                   all.x = TRUE)
+
+spines_ddgf<-all_ddg_f[Functional_feature%in%c("C-spine","R-spine")]
+
+```
+
+```{r}
+p_hatmap_spine_mean <- ggplot(spines_ddgf,
+                                    aes(x = as.factor(Pos_al),
+                                        y = factor(kinase, levels=rev(kinases)),
+                                        fill = pos_median)) +
+  geom_tile(color = "white", size = 0.3) +
+    theme_classic() +
+  scale_fill_gradientn(
+    colours = c("blue3", "grey90", "brown3"),
+    values = scales::rescale(c(-cap_val, 0, cap_val)),
+    limits = c(-cap_val, cap_val),
+    guide = "colorbar",
+    oob = scales::squish
+  )+
+geom_text(
+  data = spines[text_color == "ATP"],
+  aes(x = as.factor(Pos_al), y = kinase, label = WT_AA),
+  color = "#ffe500", size = 5
+) +
+geom_text(
+  data = spines[text_color == "none"],
+  aes(x = as.factor(Pos_al), y = kinase, label = WT_AA),
+  color = "black", size = 5
+)+
+    labs(x = "", y = "", fill =expression(Delta*Delta*G[f]))+
+  theme(
+    axis.ticks.y = element_blank(),
+    axis.ticks.x.top = element_line(),
+    legend.title = element_text(size = 15, face = "bold"),
+    legend.text = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title = element_text(size = 11),
+    axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+    strip.text =  element_text(size = 15, face = "bold")
+  )+
+  scale_y_discrete(labels = relabel_jnk2)+facet_grid2(
+    ~factor(Functional_feature),
+    scales = "free_x",
+    space = "free_x",
+    strip = strip_themed(
+      background_x = elem_list_rect(fill = c("#009548", "#b9dca6"))
+    )
+  )
+
+
+
+ggsave(p_hatmap_spine_mean,filename =paste0(output_dir_fig3,"Fig3H_spines_ddGf",format_img),height = 3,width = 6,limitsize = FALSE)
+```
+
+## ChimeraX: folding
+
+```{r}
+as_residues_all_conserv<-unique(spines_ddgf[Functional_feature=="C-spine",.(Pos,kinase,pos_median)])
+
+for (k in unique_kinases) {
+  sig_residues <- as_residues_all_conserv[kinase == k]
+  sig_residues<-sig_residues[!is.na(pos_median)]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: CspineFolding",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$pos_median)
+  )
+
+  file_name <- paste0(output_dir_chimera, "Cspine_folding", k, ".defattr")
+
+  writeLines(chimerax_lines, file_name)
+}
+
+as_residues_all_conserv<-unique(spines_ddgf[Functional_feature=="R-spine",.(Pos,kinase,pos_median)])
+
+for (k in unique_kinases) {
+  sig_residues <- as_residues_all_conserv[kinase == k]
+  sig_residues<-sig_residues[!is.na(pos_median)]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: RspineFolding",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$pos_median)
+  )
+
+  file_name <- paste0(output_dir_chimera, "Rspine_folding", k, ".defattr")
+
+  writeLines(chimerax_lines, file_name)
+}
+```
+
+# Activation loop
+
+```{r}
+act_loop<-all_allostery[Region_Name=="AL"]
+
+phospho_dt <- data.table(
+  kinase = c("FGR", "MAPK9", "MAPK9", "ZAK", "ZAK", "SRC", "TSSK2"),
+  Pos_al = c(191, 198, 200, 189, 199, 191, 199)
+)
+
+phospho_dt
+
+setkey(act_loop, kinase, Pos_al)
+setkey(phospho_dt, kinase, Pos_al)
+act_loop[
+  phospho_dt,
+  Phosphosite := TRUE
+]
+
+act_loop[is.na(Phosphosite), Phosphosite := FALSE]
+
+act_loop
+
+```
+
+## Phosphosite substitutions
+
+```{r manuscript-phosphosite-substitutions}
+ph_sub <- merge(all_ddg_dist, phospho_dt, by = c("kinase", "Pos_al"))
+ph_sub <- ph_sub[mut_aa != "*" & mut_aa != WT_AA]
+cat(sprintf("Activation-loop phosphosite substitutions: %d total ; inactivating (ddGa>0.2) = %d ; activating (ddGa<-0.2) = %d\n",
+            nrow(ph_sub), sum(ph_sub$`mean_kcal/mol` > 0.2), sum(ph_sub$`mean_kcal/mol` < -0.2)))
+st_swap <- ph_sub[(WT_AA == "S" & mut_aa == "T") | (WT_AA == "T" & mut_aa == "S")]
+cat("Ser/Thr swap ddGa at phosphosites:\n")
+print(st_swap[, .(kinase, Pos_al, WT_AA, mut_aa, ddGa = round(`mean_kcal/mol`, 2))][order(kinase, Pos_al)])
+de_sub <- ph_sub[mut_aa %in% c("D", "E")]
+cat(sprintf("Asp/Glu phosphomimetic ddGa: range %.2f to %.2f (n=%d)\n",
+            min(de_sub$`mean_kcal/mol`), max(de_sub$`mean_kcal/mol`), nrow(de_sub)))
+```
+## Phosphosite heatmap
+```{r}
+cap_val<- quantile(abs(act_loop[Pos_al%in%phospho_dt$Pos_al,.(`mean_kcal/mol`)]), probs = 0.98, na.rm = TRUE)
+
+p_hatmap_ph <- ggplot(act_loop[Pos_al%in%phospho_dt$Pos_al]) +
+
+  geom_tile(aes(
+    x = factor(kinase, levels = kinases),
+    y = factor(mut_aa, levels = aa_levels_with_mean),
+    fill = `mean_kcal/mol`
+  )) +
+  scale_fill_gradientn(
+    colours = c("blue3", "grey90", "brown3"),
+    values = scales::rescale(c(-cap_val, 0, cap_val)),
+    limits = c(-cap_val, cap_val),
+    guide = "colorbar",
+    oob = scales::squish
+
+) +
+  geom_point(
+  data = act_loop[Pos_al%in%phospho_dt$Pos_al&enrich_allostery == TRUE&is.na(Phosphosite)],
+  aes(x = factor(kinase, levels = kinases),
+      y = length(all_aa) + 0.3),
+  inherit.aes = FALSE,
+  size = 4,color="red",
+  shape = 21, fill="white",stroke = 1.1
+
+) +
+  geom_point(
+  data = act_loop[Pos_al%in%phospho_dt$Pos_al&is.na(enrich_allostery)&Phosphosite == TRUE],
+  aes(x = factor(kinase, levels = kinases),
+      y = length(all_aa) + 0.3),
+  inherit.aes = FALSE,
+  size = 4,color="purple"
+
+) +
+
+  geom_point(
+  data = act_loop[Pos_al%in%phospho_dt$Pos_al&enrich_allostery == TRUE&Phosphosite == TRUE],
+  aes(x = factor(kinase, levels = kinases),
+      y = length(all_aa) + 0.3),
+  inherit.aes = FALSE,
+  size = 4,color="red",
+  shape = 21, fill="purple",stroke = 1.1
+
+) +
+
+    geom_point(
+    aes(
+      x = factor(kinase, levels = kinases),
+      y =factor(WT_AA, levels = aa_levels_with_mean)
+
+    ),
+    shape = 21,
+    size = 3,
+    fill = "white",
+    alpha=0.6
+  )+
+
+
+  facet_grid(
+    ~factor(Pos_al),
+    scales = "free_x",
+    space = "free_x",
+  ) +
+
+  theme_classic() +
+  theme(
+    axis.text.y = element_text(color=color_axis_y, size=12),
+    axis.text.x = element_text(size = 12, angle = 90, vjust = 0.5, hjust = 1),
+    strip.text = element_text(size = 14,face = "bold"),
+
+  ) +
+  labs(x = "", y = "",fill=expression(Delta*Delta*G[a]))+
+   scale_y_discrete(expand = expansion(mult = c(0, 0.1)))+
+   scale_x_discrete(labels = relabel_jnk2)
+
+ggsave(p_hatmap_ph,filename =paste0(output_dir_fig3,"Fig3F_phosphosites",format_img),height = 5,width = 6,limitsize = FALSE)
+
+```
+
+# Core vs surface conservation
+
+```{r conservation-core-surface}
+cons_dat <- all_ddg_a[active_site == "" & core_surf %in% c("Core", "Surface") & !is.na(`mean_kcal/mol`),
+                      .(kinase, Pos_al, mut_aa, ddg = `mean_kcal/mol`, core_surf, rsasa)]
+
+N_min_shared <- 5
+per_res <- cons_dat[, {
+  w  <- dcast(.SD, mut_aa ~ kinase, value.var = "ddg")
+  km <- setdiff(names(w), "mut_aa")
+  rs <- numeric(0)
+  if (length(km) >= 2) {
+    for (p in combn(km, 2, simplify = FALSE)) {
+      x <- w[[p[1]]]; y <- w[[p[2]]]; ok <- !is.na(x) & !is.na(y)
+      if (sum(ok) >= N_min_shared) rs <- c(rs, cor(x[ok], y[ok], method = "spearman"))
+    }
+  }
+  .(res_r = if (length(rs) >= 1) mean(rs) else NA_real_,
+    n_kin = length(km), n_pairs = length(rs), rsasa = mean(rsasa))
+}, by = .(Pos_al, core_surf)][!is.na(res_r)]
+per_res[, core_surf := factor(core_surf, levels = c("Core", "Surface"))]
+
+cons_summary <- per_res[, .(n_residues = .N, median_r = median(res_r), mean_r = mean(res_r),
+                            se = sd(res_r) / sqrt(.N)), by = core_surf]
+wilcox_p <- wilcox.test(res_r ~ core_surf, data = per_res, alternative = "greater")$p.value
+cat("== Core vs Surface conservation: per-residue cross-kinase Spearman rho of ddGa ==\n")
+print(cons_summary)
+cat(sprintf("Wilcoxon (Core > Surface) rho: p = %s\n", signif(wilcox_p, 3)))
+```
+
+## Plot
+
+```{r fig5D-conservation-core-surface}
+p_cons <- ggplot(per_res, aes(x = core_surf, y = res_r)) +
+
+  geom_jitter(aes(color = core_surf), width = 0.18, height = 0, size = 0.7, alpha = 0.4) +
+  geom_violin(aes(fill = core_surf), trim = FALSE, alpha = 0.5, color = "grey30", linewidth = 0.4) +
+  scale_fill_manual(values = c(Core = "black", Surface = "grey60")) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", color = "black", linewidth = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey80") +
+  scale_color_manual(values = c(Core = "black", Surface = "grey60")) +
+  labs(x = "", y = expression("Per-residue cross-kinase "*rho*" of "*Delta*Delta*G[a]),
+       subtitle = paste0("Wilcoxon p = ", signif(wilcox_p, 2))) +
+  theme_fig2() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 11, face = "bold"))
+
+ggsave(p_cons, filename = paste0(output_dir_figS7, "FigS7C_conservation_core_surface", format_img),
+       height = 3.5, width = 2.8, limitsize = FALSE)
+```
+
+
+# Amino-acid enrichment
+
+## Allosteric classifier (FDR over non-active-site positions)
+
+```{r}
+aa_dt <- fread(paste0(results_path, "all_predicted_data.csv"))
+aa_dt <- aa_dt[, !duplicated(names(aa_dt)), with = FALSE]
+active_site_pos <- unique(aa_dt[active_site %in% c("ATP contact", "Mg positioning", "Substrate positioning"), Pos_al])
+no_AS_predicted_data <- aa_dt[!Pos_al %in% active_site_pos]
+
+no_AS_predicted_data[, z_allo_025 := (abs(`mean_kcal/mol`) - 0.2) / `std_kcal.mol`]
+no_AS_predicted_data[, p_allo_025 := 1 - pnorm(z_allo_025)]
+no_AS_predicted_data[, fdr_allo_025 := p.adjust(p_allo_025, method = "fdr")]
+no_AS_predicted_data[fdr_allo_025 < 0.1 & abs(`mean_kcal/mol`) > 0.2, allosteric := "allosteric"]
+
+no_AS_predicted_data[, mut_class := "no change"]
+no_AS_predicted_data[fdr_allo_025 < 0.1 & `mean_kcal/mol` < -0.2, mut_class := "activating"]
+no_AS_predicted_data[fdr_allo_025 < 0.1 & `mean_kcal/mol` >  0.2, mut_class := "inactivating"]
+
+no_AS_predicted_data[, allosteric_dir := "no_allosteric"]
+no_AS_predicted_data[allosteric == "allosteric" & mut_class == "inactivating", allosteric_dir := "allosteric_inactivating"]
+no_AS_predicted_data[allosteric == "allosteric" & mut_class == "activating",   allosteric_dir := "allosteric_activating"]
+```
+
+## Enrichment function and amino-acid annotation
+
+```{r}
+aa_enrichment_mutation_dir <- function(dt, aa_col = "WT_AA", mutation_col = "allosteric_dir") {
+  dt <- as.data.table(dt)
+  dt[, (mutation_col) := factor(get(mutation_col),
+                                levels = c("allosteric_inactivating", "allosteric_activating", "no_allosteric"))]
+  classes <- c("allosteric_inactivating", "allosteric_activating")
+  all_results <- rbindlist(lapply(classes, function(class_type) {
+    dt[, comp_label := ifelse(get(mutation_col) == class_type, class_type, "other")]
+    counts <- dt[, .N, by = c(aa_col, "comp_label")]
+    counts <- data.table::dcast(counts, get(aa_col) ~ comp_label, value.var = "N", fill = 0)
+    if (!"other" %in% names(counts)) counts[, other := 0]
+    if (!class_type %in% names(counts)) counts[, (class_type) := 0]
+    setnames(counts, c("AA", "n_target", "n_other"))
+    total_target <- sum(counts$n_target)
+    total_other <- sum(counts$n_other)
+    results <- counts[, {
+      test <- fisher.test(matrix(c(n_target, n_other,
+                                   total_target - n_target,
+                                   total_other - n_other), nrow = 2))
+      .(p_value = test$p.value, OR = test$estimate)
+    }, by = AA]
+    results[, fdr := p.adjust(p_value, method = "fdr")]
+    results <- merge(results, counts, by = "AA")
+    results[, prop_target := n_target / (n_target + n_other)]
+    results[, allosteric_type := class_type]
+    results[]
+  }))
+  all_results[order(allosteric_type, fdr)]
+}
+
+AA_type <- data.frame("AA" = all_aa[1:20],
+                      "type" = c("glycine", rep("aliphatic", 5), rep("aromatic", 3), rep("positive", 2),
+                                 rep("negative", 2), rep("polar", 6), "proline"))
+color_AAtype <- c("aliphatic" = "darkgrey", "aromatic" = "#9A703EFF", "negative" = "#EE0011FF",
+                  "positive" = "#0C5BB0FF", "polar" = "#15983DFF", "glycine" = "#FA6B09FF",
+                  "proline" = "#FEC10BFF")
+color_axis_x <- c("#FEC10BFF", rep("#15983DFF", 6), rep("#EE0011FF", 2), rep("#0C5BB0FF", 2),
+                  rep("#9A703EFF", 3), rep("darkgrey", 5), "#FA6B09FF")
+mut_levels <- rev(c("G","A","V","L","M","I","F","Y","W","K","R","D","E","S","T","C","N","Q","H","P"))
+```
+
+## Pooled enrichment
+
+```{r}
+aa_dir_plot <- function(tab, xlab_txt) {
+  d <- merge(tab, AA_type, by = "AA", all.x = TRUE)
+  d[, AA := factor(AA, levels = mut_levels)]
+  ggplot(d, aes(x = AA, y = log2(OR), fill = type)) +
+    geom_col(width = 0.8) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.6) +
+    geom_text(data = d[fdr < 0.1], aes(label = "*"), vjust = 0, size = 5, color = "black") +
+    scale_fill_manual(values = color_AAtype, name = "AA type") +
+    labs(x = xlab_txt, y = "Log2(OR allosteric mutation)") +
+    theme_classic(base_size = 14) +
+    theme(legend.position = "right",
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank(),
+          axis.text.x = element_text(color = color_axis_x),
+          axis.text.y = element_text(color = "black")) +
+    ylim(-2, 1.5) +
+    facet_wrap(~allosteric_type, nrow = 2,
+               labeller = as_labeller(c(allosteric_activating = "Allosteric activating",
+                                        allosteric_inactivating = "Allosteric inactivating")))
+}
+
+enrich_WT_dir  <- aa_enrichment_mutation_dir(no_AS_predicted_data, aa_col = "WT_AA")
+enrich_MUT_dir <- aa_enrichment_mutation_dir(no_AS_predicted_data, aa_col = "mut_aa")
+
+aa_bars <- ggarrange(aa_dir_plot(enrich_WT_dir, "WT Amino Acid"),
+                     aa_dir_plot(enrich_MUT_dir, "Mutant Amino Acid") + theme(axis.title.y = element_blank()),
+                     ncol = 2, common.legend = TRUE, align = "hv")
+ggsave(aa_bars, filename = paste0(output_dir_figS6, "FigS6E_amino_acid_enrichment", format_img),
+       height = 8, width = 9, limitsize = FALSE)
+```
+
+## Per-kinase enrichment
+
+```{r}
+or_kin <- rbind(
+  rbindlist(lapply(kinases, function(k) aa_enrichment_mutation_dir(no_AS_predicted_data[kinase == k], "WT_AA")[, `:=`(kinase = k, role = "WT Amino Acid")])),
+  rbindlist(lapply(kinases, function(k) aa_enrichment_mutation_dir(no_AS_predicted_data[kinase == k], "mut_aa")[, `:=`(kinase = k, role = "Mutant Amino Acid")]))
+)
+or_kin[, log2OR := log2(OR)]
+or_kin[n_target < 3 | !is.finite(log2OR), log2OR := NA_real_]
+or_kin[, AA := factor(AA, levels = mut_levels)]
+or_kin[, kinase := factor(kinase, levels = kinases)]
+or_kin[, role := factor(role, levels = c("WT Amino Acid", "Mutant Amino Acid"))]
+or_kin[, direction := factor(allosteric_type,
+                             levels = c("allosteric_activating", "allosteric_inactivating"),
+                             labels = c("Activating", "Inactivating"))]
+or_lim <- max(abs(or_kin$log2OR), na.rm = TRUE)
+
+aa_heatmap <- ggplot(mapping = aes(x = AA, y = kinase)) +
+  geom_tile(data = or_kin[direction == "Activating"], aes(fill = log2OR), color = "white") +
+  scale_fill_gradient2(low = "grey60", mid = "white", high = "blue3", midpoint = 0,
+                       limits = c(-or_lim, or_lim), na.value = "white",
+                       name = expression(atop("Activating", "Log2(OR)"))) +
+  ggnewscale::new_scale_fill() +
+  geom_tile(data = or_kin[direction == "Inactivating"], aes(fill = log2OR), color = "white") +
+  scale_fill_gradient2(low = "grey60", mid = "white", high = "brown3", midpoint = 0,
+                       limits = c(-or_lim, or_lim), na.value = "white",
+                       name = expression(atop("Inactivating", "Log2(OR)"))) +
+  geom_text(data = or_kin[fdr < 0.1 & is.finite(log2OR) & log2OR > 0],
+            aes(label = "*"), color = "black", size = 6, vjust = 0.75) +
+  scale_y_discrete(labels = relabel_jnk2) +
+  labs(x = "Amino acid", y = "") +
+  facet_grid(direction ~ role) +
+  theme_classic(base_size = 12) +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom",
+        axis.text.x = element_text(color = color_axis_x),
+        axis.text.y = element_text(color = "black"))
+ggsave(aa_heatmap, filename = paste0(output_dir_figS6, "FigS6H_amino_acid_enrichment_by_kinase", format_img),
+       height = 4, width = 9, limitsize = FALSE)
+```
+
+## Reported odds ratios
+
+```{r}
+echo_or <- function(tab, aas) {
+  t <- as.data.table(tab)[AA %in% aas]
+  t[order(-OR), .(AA, OR = round(OR, 2), log2OR = round(log2(OR), 2), fdr = signif(fdr, 2), n_target, n_other)]
+}
+cat("\n=== Inhibitory allosteric: WT residues (I, Y, H, V) ===\n")
+print(echo_or(enrich_WT_dir[allosteric_type == "allosteric_inactivating"], c("I","Y","H","V")))
+cat("\n=== Inhibitory allosteric: mutant residues (P, R, G, W) ===\n")
+print(echo_or(enrich_MUT_dir[allosteric_type == "allosteric_inactivating"], c("P","R","G","W")))
+cat("\n=== Activating allosteric: mutant residues (W, F, G) ===\n")
+print(echo_or(enrich_MUT_dir[allosteric_type == "allosteric_activating"], c("W","F","G")))
+cat("\n=== Activating allosteric: WT leucine, all kinases ===\n")
+print(echo_or(enrich_WT_dir[allosteric_type == "allosteric_activating"], "L"))
+cat("\n=== Activating allosteric: WT residue per kinase (SRC A, JNK2 F, ZAK L) ===\n")
+print(or_kin[direction == "Activating" & role == "WT Amino Acid" &
+             ((kinase == "SRC" & AA == "A") | (kinase == "MAPK9" & AA == "F") | (kinase == "ZAK" & AA == "L")),
+             .(kinase, AA, OR = round(OR, 2), fdr = signif(fdr, 2), n_target)])
+```

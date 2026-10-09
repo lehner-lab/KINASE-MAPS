@@ -1,0 +1,281 @@
+---
+title: "02 MoCHI quality"
+output: html_notebook
+---
+```{r setup, include=FALSE}
+library(ggplot2)
+library(data.table)
+library(ggpubr)
+library(scales)
+library(ggpointdensity)
+library(viridis)
+library(plot3D)
+options(datatable.print.invisible = TRUE)
+```
+
+
+# Setup
+
+```{r}
+load("source_variables.RData")
+
+output_dir_fig <- paste0(results_path, "Fig1/")
+output_dir_figS <- paste0(results_path, "FigS2/")
+dir.create(output_dir_fig, showWarnings = FALSE, recursive = TRUE)
+dir.create(output_dir_figS, showWarnings = FALSE, recursive = TRUE)
+
+predicted_phenotypes<-fread(paste0(results_newdata,"predicted_phenotypes.csv"))
+
+format_img<-".png"
+```
+
+
+# Held-out predictions and additive traits
+
+## Helper functions
+
+```{r}
+extract_prediction<-function(row){
+  return(as.numeric(row[paste0("fold_", as.numeric(row["Fold"]))]))}
+
+
+extract_additive_trait <- function(row, trait){
+  row <- as.list(row)
+  if (isTRUE(row$WT)) {
+    return(0)
+  } else {
+    if (trait == "Abundance") {
+      return(as.numeric(row[[ row$additive_trait_column_f ]]))
+    } else {
+      return(as.numeric(row[[ row$additive_trait_column_a ]]))
+    }
+  }
+}
+```
+
+## Predicted fitness
+
+```{r}
+predicted_phenotypes[, predicted_fitness := apply(.SD, 1, extract_prediction), .SDcols = colnames(predicted_phenotypes)]
+```
+
+## Additive traits
+
+```{r}
+predicted_phenotypes[,additive_trait_column_f := paste0("fold_", Fold, "_additive_trait0")]
+  predicted_phenotypes[,additive_trait_column_a := paste0("fold_", Fold, "_additive_trait1")]
+  predicted_phenotypes[, additive_trait_f := as.numeric(apply(.SD, 1, extract_additive_trait, "Abundance"))]
+  predicted_phenotypes[, additive_trait_a := as.numeric(apply(.SD, 1, extract_additive_trait, "Activity"))]
+
+setnames(predicted_phenotypes, "fitness", "observed_fitness")
+```
+
+# Observed vs predicted fitness
+
+## Abundance
+```{r}
+p_obs_vs_pred_fold<-ggplot(predicted_phenotypes[Abundance==1], aes(y = observed_fitness, x = predicted_fitness)) +
+  geom_pointdensity(size = 0.5)+
+  scale_color_viridis(option = "magma", begin = 0.05, end = 0.85, guide = "none")+
+  stat_cor(aes(label = ..r.label..),size=5,col="black",label.x.npc = "left",label.y.npc ="top")+
+  facet_wrap(~factor(kinase, levels=kinases),ncol=7,scales="free",labeller = lab_kinase)+
+  geom_smooth(method="lm",size=0.5)+
+  theme_classic(base_size = 14) +
+  labs(
+    title = "Folding",
+    y = "Observed Fitness",
+    x = "Predicted Fitness"
+  )
+
+ggsave(p_obs_vs_pred_fold, filename = paste0(output_dir_figS, "FigS2A_obs_vs_pred_folding", format_img), height = 3.5, width = 15)
+
+p_obs_vs_pred_fold_zak<-ggplot(predicted_phenotypes[Abundance==1&kinase=="ZAK"][, panel := "abundance"], aes(y = observed_fitness, x = predicted_fitness)) +
+  geom_pointdensity(size = 0.5)+
+  scale_color_viridis(option = "magma", begin = 0.05, end = 0.85, guide = "none")+
+  stat_cor(aes(label = ..r.label..),size=5,col="black",label.x.npc = "left",label.y.npc ="top")+
+  geom_smooth(method="lm",size=0.5)+
+  facet_wrap(~panel)+
+  theme_classic(base_size = 14) +
+  theme(strip.text = element_text(face = "bold"))+
+  labs(
+    y = "Observed Fitness",
+    x = "Predicted Fitness"
+  )+ylim(-1,0.5)
+
+```
+
+## Activity
+
+```{r}
+p_obs_vs_pred_act<-ggplot(predicted_phenotypes[Activity==1], aes(y = observed_fitness, x = predicted_fitness)) +
+  geom_pointdensity(size = 0.5)+
+  scale_color_viridis(option = "magma", begin = 0.05, end = 0.85, guide = "none")+
+  stat_cor(aes(label = ..r.label..),size=5,col="black",label.x.npc = "left",label.y.npc ="top")+
+  facet_wrap(~factor(kinase, levels=kinases),ncol=7,scales="free",labeller = lab_kinase)+
+  geom_smooth(method="lm",size=0.5)+
+  theme_classic(base_size = 14) +
+  labs(
+    title = "Activity",
+    y = "Observed Fitness",
+    x = "Predicted Fitness"
+  )
+
+ggsave(p_obs_vs_pred_act, filename = paste0(output_dir_figS, "FigS2B_obs_vs_pred_activity", format_img), height = 3.5, width = 15)
+
+
+p_obs_vs_pred_act_zak<-ggplot(predicted_phenotypes[Activity==1&kinase=="ZAK"][, panel := "activity"], aes(y = observed_fitness, x = predicted_fitness)) +
+  geom_pointdensity(size = 0.5)+
+  scale_color_viridis(option = "magma", begin = 0.05, end = 0.85, guide = "none")+
+  stat_cor(aes(label = ..r.label..),size=5,col="black",label.x.npc = "left",label.y.npc ="top")+
+  geom_smooth(method="lm",size=0.5)+
+  facet_wrap(~panel)+
+  theme_classic(base_size = 14) +
+  theme(strip.text = element_text(face = "bold"),
+        axis.text.y = element_blank())+
+  labs(
+    y = "",
+    x = "Predicted Fitness"
+  )+ylim(-1,0.5)
+
+```
+
+## ZAK, abundance and activity
+
+```{r}
+p_obs_vs_pred_zak<-ggarrange(p_obs_vs_pred_fold_zak,
+                               p_obs_vs_pred_act_zak,
+                             ncol=2,widths = c(1,0.9))
+ggsave(p_obs_vs_pred_zak, filename = paste0(output_dir_fig, "Fig1I_obs_vs_pred", format_img), height = 3, width = 6)
+
+```
+
+
+# Abundance fitness vs ddGf
+
+```{r}
+p_fit_vs_ddg<-ggplot(predicted_phenotypes[Abundance==1], aes(y = observed_fitness, x = additive_trait_f)) +
+  geom_pointdensity(size = 0.5) +
+  scale_color_viridis(option = "magma", begin = 0.05, end = 0.85, guide = "none") +
+  geom_smooth(aes(x=additive_trait_f, y=predicted_fitness),color="red")+
+  theme_classic(base_size = 14) +
+  labs(
+  y = "Observed Fitness",
+    x = expression(Delta*Delta*"G folding")
+  )+facet_wrap(~factor(kinase, levels=kinases),scales="free",ncol=7,labeller = lab_kinase)+
+  theme(legend.position = "none")
+
+ggsave(p_fit_vs_ddg, filename = paste0(output_dir_figS, "FigS2C_folding_sigmoid", format_img), height = 3, width = 15)
+
+p_fit_vs_ddg_zak<-ggplot(predicted_phenotypes[Abundance==1&kinase=="ZAK"], aes(y = observed_fitness, x = additive_trait_f)) +
+  geom_pointdensity(size = 0.5) +
+  scale_color_viridis(option = "magma", begin = 0.05, end = 0.85, guide = "none") +
+  geom_smooth(aes(x=additive_trait_f, y=predicted_fitness),color="red")+
+  theme_classic(base_size = 13) +
+  labs(
+  y = "Observed Fitness",
+    x =  expression(Delta*Delta*"G folding")
+  )+
+  theme(legend.position = "none")
+
+ggsave(p_fit_vs_ddg_zak, filename = paste0(output_dir_fig, "Fig1J_folding_sigmoid", format_img), height = 2.8, width = 3)
+```
+
+# Activity fitness vs ddGf and ddGa (3D)
+
+```{r}
+plot_landscape_smooth <- function(
+  dt,               
+  kin,               
+  num_grid = 15      
+){
+  dt_activity <- dt[Abundance == 0 & kinase == kin,
+                    .(aa_seq, additive_trait_a, observed_fitness, predicted_fitness)]
+  dt_folding <- dt[Abundance == 1 & kinase == kin,
+                   .(aa_seq, additive_trait_f)]
+
+  dt_merged <- merge(dt_activity, dt_folding, by = "aa_seq")
+
+  dt_clean <- na.omit(dt_merged)
+  dt_clean <- dt_clean[is.finite(additive_trait_f) &
+                       is.finite(additive_trait_a) &
+                       is.finite(predicted_fitness)]
+
+  if(nrow(dt_clean) < 10) stop("Not enough data points.")
+
+  x_seq <- seq(min(dt_clean$additive_trait_f), max(dt_clean$additive_trait_f), length = num_grid)
+  y_seq <- seq(min(dt_clean$additive_trait_a), max(dt_clean$additive_trait_a), length = num_grid)
+  grid_df <- expand.grid(additive_trait_f = x_seq, additive_trait_a = y_seq)
+
+  loess_model <- loess(predicted_fitness ~ additive_trait_f * additive_trait_a,
+                       data = dt_clean, span = 0.5)
+
+  grid_z <- predict(loess_model, newdata = grid_df)
+
+
+  z_matrix <- matrix(grid_z, nrow = num_grid, ncol = num_grid)
+
+
+  plot3D::persp3D(
+    x = x_seq,
+    y = y_seq,
+    z = z_matrix,
+
+    color = "white", alpha = 0,
+    border = "red", lwd = 0.5,
+    colkey = FALSE,
+    phi = 15, theta = 70,
+    r = 2, shade = 0.4, axes = TRUE, scale = TRUE, box = T,
+  nticks = 5,
+  tck = -0.01,
+    xlab = "",
+    ylab = "",
+    zlab = "",
+    ticktype = "detailed"
+  )
+
+  plot3D::scatter3D(
+    x = dt_clean$additive_trait_f,
+    y = dt_clean$additive_trait_a,
+    z = dt_clean$observed_fitness,
+    add = TRUE,
+    col = alpha("black", 0.15), pch = 19, cex = 0.2
+  )
+}
+graphics.off()
+
+png(filename = paste0(output_dir_fig, "Fig1J_3D_surface", format_img),
+    width = 4, height = 4, units = "in", res = 300, bg = "transparent")
+plot_landscape_smooth(dt = predicted_phenotypes, kin = "ZAK")
+dev.off()
+```
+
+# Double-mutant prediction accuracy
+
+```{r reported_attenuation}
+if (file.exists(paste0(results_newdata, "all_data.Rdata"))) {
+  .e <- new.env(); load(paste0(results_newdata, "all_data.Rdata"), envir = .e)
+  ad <- data.table::as.data.table(.e$all_doubles)
+  rel <- ad[Nham_aa == 2, {
+    r12 <- cor(fitness1_uncorr, fitness2_uncorr, use = "pairwise.complete.obs")
+    r13 <- cor(fitness1_uncorr, fitness3_uncorr, use = "pairwise.complete.obs")
+    r23 <- cor(fitness2_uncorr, fitness3_uncorr, use = "pairwise.complete.obs")
+    .(reliability = median(c(r12, r13, r23)))
+  }, by = .(kinase, assay)]
+  rel[, assay := fifelse(assay == "abundance", "Abundance", "Activity")]
+
+  robs <- rbind(
+    predicted_phenotypes[Nham_aa == 2 & Abundance == 1,
+      .(assay = "Abundance", r_obs = cor(observed_fitness, predicted_fitness, use = "pairwise.complete.obs")), by = kinase],
+    predicted_phenotypes[Nham_aa == 2 & Activity == 1,
+      .(assay = "Activity",  r_obs = cor(observed_fitness, predicted_fitness, use = "pairwise.complete.obs")), by = kinase])
+
+  att <- merge(robs, rel, by = c("kinase", "assay"), all.x = TRUE)
+  att[, r_corrected := r_obs / sqrt(reliability)]
+  cat("== Double-mutant prediction: observed r, replicate reliability, attenuation-corrected r ==\n")
+  print(att[order(assay, kinase)])
+  medn <- att[, .(median_r_observed  = round(median(r_obs, na.rm = TRUE), 3),
+                  median_r_corrected = round(median(r_corrected, na.rm = TRUE), 3)), by = assay]
+  cat("== Median across kinases (observed r: all kinases; corrected r: SRC excluded) ==\n")
+  print(medn)
+}
+```

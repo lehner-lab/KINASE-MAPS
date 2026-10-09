@@ -1,0 +1,102 @@
+---
+title: "09 Domain architecture"
+output: html_notebook
+---
+
+```{r}
+library(data.table)
+library(ggplot2)
+```
+
+# Setup
+
+```{r}
+load("source_variables.RData")
+
+output_dir_figS <- paste0(results_path, "FigS1/")
+dir.create(output_dir_figS, showWarnings = FALSE, recursive = TRUE)
+```
+
+# Domain boundaries (UniProt: SRC P12931, FGR P09769, ZAK Q9NYL2-2, MAPK9 P45984, TSSK2 Q96PF2)
+
+```{r}
+lengths <- c(SRC = 536, FGR = 529, ZAK = 455, MAPK9 = 424, TSSK2 = 358)
+ypos <- setNames(rev(seq_along(kinases)), kinases)
+
+dom <- rbindlist(list(
+  data.table(kinase = "SRC",   type = "SH3",    label = "SH3",    start = 84,  end = 145),
+  data.table(kinase = "SRC",   type = "SH2",    label = "SH2",    start = 151, end = 248),
+  data.table(kinase = "SRC",   type = "kinase", label = "Kinase", start = 270, end = 523),
+
+  data.table(kinase = "FGR",   type = "SH3",    label = "SH3",    start = 77,  end = 138),
+  data.table(kinase = "FGR",   type = "SH2",    label = "SH2",    start = 144, end = 241),
+  data.table(kinase = "FGR",   type = "kinase", label = "Kinase", start = 263, end = 516),
+
+  data.table(kinase = "ZAK",   type = "kinase", label = "Kinase", start = 16,  end = 277),
+  data.table(kinase = "ZAK",   type = "lz",     label = "LZ",     start = 287, end = 308),
+
+  data.table(kinase = "MAPK9", type = "kinase", label = "Kinase", start = 26,  end = 321),
+  data.table(kinase = "MAPK9", type = "dis",    label = "IDR",    start = 368, end = 424),
+
+  data.table(kinase = "TSSK2", type = "kinase", label = "Kinase", start = 12,  end = 272),
+  data.table(kinase = "TSSK2", type = "dis",    label = "IDR",    start = 302, end = 358)
+))
+dom[, kinase := factor(kinase, levels = kinases)]
+dom[, y := ypos[as.character(kinase)]]
+
+back <- data.table(kinase = factor(kinases, levels = kinases),
+                   start = 1, end = lengths[kinases], y = ypos[kinases])
+```
+
+# Plot
+
+```{r}
+h_back <- 0.06
+h_dom  <- 0.30
+
+dom_cols <- c(kinase = "#D7263D", SH3 = "#4C72B0", SH2 = "#55A868", lz = "#8172B3", dis = "#BDBDBD")
+dom_labels_legend <- c(kinase = "Kinase domain", SH3 = "SH3", SH2 = "SH2",
+                       lz = "Leucine zipper", dis = "Disordered region")
+dom[, type := factor(type, levels = names(dom_cols))]
+dom[, lab_show := (end - start) >= 30]
+
+p_domains <- ggplot() +
+  geom_rect(data = back,
+            aes(xmin = start, xmax = end, ymin = y - h_back, ymax = y + h_back),
+            fill = "grey80", colour = NA) +
+  geom_rect(data = dom[type != "kinase"],
+            aes(xmin = start, xmax = end, ymin = y - h_dom, ymax = y + h_dom, fill = type, colour = type),
+            linewidth = 0.3) +
+  geom_rect(data = dom[type == "kinase"],
+            aes(xmin = start, xmax = end, ymin = y - h_dom, ymax = y + h_dom, fill = type, colour = type),
+            linewidth = 0.9) +
+  geom_text(data = dom[lab_show == TRUE],
+            aes(x = (start + end) / 2, y = y, label = label),
+            colour = "white", fontface = "bold", size = 5) +
+  geom_text(data = back,
+            aes(x = -8, y = y, label = relabel_jnk2(as.character(kinase))),
+            hjust = 1, fontface = "bold", size = 5.2) +
+  geom_text(data = back,
+            aes(x = end + 8, y = y, label = paste0(end, " aa")),
+            hjust = 0, size = 4, colour = "grey30") +
+  scale_fill_manual(values = dom_cols, labels = dom_labels_legend,
+                    breaks = names(dom_cols), name = NULL) +
+  scale_colour_manual(values = dom_cols, labels = dom_labels_legend,
+                      breaks = names(dom_cols), name = NULL) +
+  scale_x_continuous("Residue position", limits = c(-90, 570),
+                     breaks = seq(0, 500, 100), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0.4, length(kinases) + 0.6), expand = c(0, 0)) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.3),
+        axis.title.y = element_blank(),
+        axis.text.y  = element_blank(),
+        legend.position = "bottom",
+        plot.margin  = margin(10, 20, 10, 10),
+        legend.text  = element_text(size = 14))
+
+ggsave(p_domains, filename = paste0(output_dir_figS, "FigS1I_domain_architecture", format_img),
+       width = 9, height = 4.2, useDingbats = FALSE)
+```

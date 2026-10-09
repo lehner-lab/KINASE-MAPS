@@ -1,0 +1,454 @@
+---
+title: "04 Active-site conservation"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(scales)
+library(patchwork)
+```
+
+# Setup
+
+```{r}
+load("source_variables.RData")
+
+output_dir_fig <- paste0(results_path, "Fig3/")
+output_dir_figS5 <- paste0(results_path, "FigS5/")
+output_dir_chimera <- paste0(results_path, "00_chimera/")
+dir.create(output_dir_fig, showWarnings = FALSE, recursive = TRUE)
+dir.create(output_dir_figS5, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+# Read ddG
+
+```{r}
+all_ddg<-read.csv(paste0(results_newdata,"all_ddg_norm.csv"))
+
+setDT(all_ddg)
+setnames(all_ddg,"mean_kcal.mol","mean_kcal/mol_old")
+setnames(all_ddg,"std_kcal.mol","std_kcal.mol_old")
+setnames(all_ddg,"ddg_norm","mean_kcal/mol")
+setnames(all_ddg,"std_kcal_norm","std_kcal.mol")
+
+all_ddg[,mut_aa:=substr(as.character(id),nchar(as.character(id)),nchar(as.character(id)))]
+
+all_ddg<-all_ddg[mut_aa!="*"]
+
+all_ddg_a<-all_ddg[assay=="Activity",]
+fwrite(all_ddg,paste0(results_newdata,"all_ddg_norm_clean.csv"))
+```
+
+# Measurement counts and active-site size
+
+```{r manuscript_ddg_counts_and_as_size}
+cat("=== ddG measurement counts (non-WT, non-stop; both assays) ===\n")
+print(all_ddg[, .(n_measurements = .N), by = assay])
+cat(sprintf("ddGf (Folding)  measurements: %d\n", all_ddg[assay == "Folding",  .N]))
+cat(sprintf("ddGa (Activity) measurements: %d\n", all_ddg[assay == "Activity", .N]))
+
+cat("\n=== Active-site size (KinCore positions with active_site != \"\") ===\n")
+print(all_ddg_a[active_site != "", .(n_positions = uniqueN(Pos_al)), by = active_site])
+cat(sprintf("Total active-site positions: %d\n",
+            uniqueN(all_ddg_a[active_site != "", Pos_al])))
+cat(sprintf("Active-site ddGa measurements: %d\n", all_ddg_a[active_site != "", .N]))
+```
+
+# Active-site region medians
+
+```{r manuscript_region_medians}
+region_median <- function(label, mask) {
+  v <- all_ddg_a[mask, `mean_kcal/mol`]
+  cat(sprintf("%-64s median ddGa = %.2f (n = %d mutations)\n",
+              label, median(v, na.rm = TRUE), length(v)))
+}
+cat("=== Active-site region median ddGa (median of mutation ddGa) ===\n")
+region_median("Mg-positioning loop (active_site == 'Mg positioning')",
+              all_ddg_a$active_site == "Mg positioning")
+region_median("Catalytic-loop ATP contacts (aligned 161,163,165,166,168)",
+              all_ddg_a$Pos_al %in% c(161, 163, 165, 166, 168))
+region_median("N-terminal activation-loop substrate segment (aligned 202-206)",
+              all_ddg_a$Pos_al %in% 202:206)
+region_median("Glycine-rich loop (aligned 34-39)",
+              all_ddg_a$Pos_al %in% 34:39)
+```
+
+
+# Per-position median ddGa
+
+```{r}
+ddg_median_a <- all_ddg_a[, .(pos_median = median(`mean_kcal/mol`, na.rm = TRUE)),
+                                 by = .(Pos, kinase, assay,Pos_al)]
+all_ddg_a <- merge(all_ddg_a, ddg_median_a,
+                   by = c("Pos", "kinase", "assay","Pos_al"),
+                   all.x = TRUE)
+```
+
+# Activity classifier
+
+```{r}
+all_ddg_a[,z_twotailed:=(abs(`mean_kcal/mol`)-0.2)/`std_kcal.mol`]
+all_ddg_a[,p_twotailed:=1-pnorm(z_twotailed)]
+all_ddg_a[,fdr_twotailed:=p.adjust(p_twotailed,method = "fdr")]
+
+
+all_ddg_a[,class:="no change"]
+all_ddg_a[fdr_twotailed<0.1 & `mean_kcal/mol`< -0.2,class:="activating"]
+all_ddg_a[fdr_twotailed<0.1 & `mean_kcal/mol`>0.2,class:="inactivating"]
+
+cat("=== Activating and inactivating mutations ===\n")
+print(all_ddg_a[class != "no change", .N, by = class])
+print(dcast(all_ddg_a[class != "no change", .N, by = .(kinase, class)], kinase ~ class, value.var = "N"))
+```
+
+
+# Cross-kinase divergence
+```{r}
+active_site_data<-all_ddg_a[active_site!=""]
+active_site_data_pos_only<-unique(active_site_data$Pos_al)
+active_site_data_pos<-unique(all_ddg_a[active_site!="",.(Pos_al,active_site)])
+
+all_active_site_data<-all_ddg_a[Pos_al%in%c(active_site_data_pos_only)]
+
+mut_divergence <- all_active_site_data[, {
+  vals <- `mean_kcal/mol`[!is.na(`mean_kcal/mol`)]
+  list(mut_div = if (length(vals) >= 2) mean(dist(vals)) else NA_real_)
+}, by = .(Pos_al, mut_aa)]
+
+global_pos_divergence <- mut_divergence[, .(
+  pos_divergence = mean(mut_div, na.rm = TRUE)
+), by = Pos_al]
+global_pos_divergence <- merge(global_pos_divergence, active_site_data_pos)
+
+p_divergence_strip <- ggplot(global_pos_divergence, aes(x = as.factor(Pos_al), y = "Divergence", fill = pos_divergence)) +
+
+	geom_tile() +
+
+  scale_fill_gradient2(
+  low = "darkorange4",
+  mid = "orange",
+  high = "grey95",
+  midpoint = 0.35,
+  limits = c(0.2, 0.5),
+  oob = scales::squish,
+  name = "Mean\nDiff" )+
+
+	theme_classic(base_size = 14) +
+	labs(
+		x = "",
+		y = ""
+	) +
+	theme(
+		axis.text.y = element_blank(),
+		axis.ticks.y = element_blank(),
+		panel.grid = element_blank(),
+		legend.position = "right",
+		legend.title = element_text(size = 15),
+		legend.text = element_text(size = 15),
+		legend.key.height = unit(0.4, "cm"),
+		legend.key.width  = unit(0.6, "cm"),
+		axis.text.x = element_text(size = 15, angle = 90, vjust = 0.5, hjust = 1),
+		strip.text =  element_blank()
+
+	) +
+
+	scale_x_discrete(expand = c(0, 0)) +
+	scale_y_discrete(expand = c(0, 0))+
+  facet_grid(~active_site, scales = "free_x",space = "free_x",
+             labeller = labeller(active_site = label_wrap_gen(width = 10)))
+
+```
+
+# Adenosine region
+
+```{r manuscript_adenosine_region}
+aden_pos <- c(88, 110, 111, 112, 113, 117)
+
+v_aden <- all_ddg_a[Pos_al %in% aden_pos, `mean_kcal/mol`]
+cat("=== Adenosine region ===\n")
+cat(sprintf("Pooled median ddGa over adenosine residues (%s): %.2f (n = %d mutations)\n",
+            paste(aden_pos, collapse = ","), median(v_aden, na.rm = TRUE), length(v_aden)))
+
+atp_pos  <- unique(global_pos_divergence[active_site == "ATP contact", Pos_al])
+aden_div <- global_pos_divergence[Pos_al %in% aden_pos, pos_divergence]
+rest_div <- global_pos_divergence[Pos_al %in% setdiff(atp_pos, aden_pos), pos_divergence]
+cat(sprintf("Divergence, adenosine residues:          mean = %.2f  median = %.2f  (n = %d)\n",
+            mean(aden_div), median(aden_div), length(aden_div)))
+cat(sprintf("Divergence, rest of ATP-contact residues: mean = %.2f  median = %.2f  (n = %d)\n",
+            mean(rest_div), median(rest_div), length(rest_div)))
+```
+
+# Active-site heatmap
+```{r}
+cap_val <- quantile(abs(active_site_data$pos_median), probs = 0.99, na.rm = TRUE)
+heatmap_plot_dt<-unique(active_site_data[,.(Pos_al,kinase,pos_median,ATP,active_site,WT_AA)])
+
+p_heatmap_dist_activesite <-ggplot(heatmap_plot_dt,
+                                    aes(x = as.factor(Pos_al),
+                                        y = factor(kinase, levels=rev(kinases)),
+                                        fill = pos_median)) +
+  geom_tile(color = "white", size = 0.3) +
+geom_text(
+  data = heatmap_plot_dt[ATP=="ATP contact"],
+  aes(x = as.factor(Pos_al), y = kinase, label = WT_AA),
+  color = "#ffe500", size = 5,fontface = "bold"
+) +
+geom_text(
+  data = heatmap_plot_dt[ATP == "no ATP contact"&active_site!=""],
+  aes(x = as.factor(Pos_al), y = kinase, label = WT_AA),
+  color = "black", size = 5
+)+
+  scale_fill_gradientn(
+    colours = c("blue3", "grey90", "brown3"),
+    values = scales::rescale(c(-cap_val, 0, cap_val)),
+    limits = c(-cap_val, cap_val),
+    guide = "colorbar",
+    oob = scales::squish
+  ) +
+  theme_classic() +
+  labs(x = "", y = "", fill =expression(Delta*Delta*G[a]), color = "") +
+  theme(
+    axis.ticks = element_blank(),
+    axis.ticks.x.top = element_line(),
+    plot.title = element_blank(),
+    legend.title = element_text(size = 15, face = "bold"),
+    legend.text = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title = element_text(size = 11),
+    axis.text.x = element_blank(),
+
+    strip.text =  element_text(size = 15, face = "bold")
+  ) +
+    facet_grid(~active_site, scales = "free_x",space = "free_x",
+             labeller = labeller(active_site = label_wrap_gen(width = 10)))+
+  scale_y_discrete(expand = expansion(mult = c(0, 0.25)), labels = relabel_jnk2)+
+      guides(pattern = "none", color = "none")
+
+
+```
+## Median across kinases
+
+
+```{r}
+global_pos_effect <- all_active_site_data[, .(
+	pos_median_all = median(pos_median, na.rm = TRUE)
+), by = Pos_al]
+global_pos_effect<-merge(global_pos_effect,unique(active_site_data[,.(Pos_al,Pos,pos_median,active_site)]))
+
+p_effect_strip <- ggplot(global_pos_effect, aes(x = as.factor(Pos_al), y = "Median", fill = pos_median_all)) +
+
+	geom_tile() +
+
+  scale_fill_gradientn(
+    colours = c("blue3", "grey90", "brown3"),
+    values = scales::rescale(c(-cap_val, 0, cap_val)),
+    limits = c(-cap_val, cap_val),
+    guide = "colorbar",
+    oob = scales::squish
+  ) +
+
+	theme_classic(base_size = 14) +
+	labs(
+		x = "",
+		y=""
+	) +
+	theme(
+	  axis.text.y = element_text(size = 15,color="black"),
+		axis.text.x = element_blank(),
+		axis.ticks = element_blank(),
+		panel.grid = element_blank(),
+		legend.position = "none",
+		   strip.text =  element_blank()
+
+	) +
+
+	scale_x_discrete(expand = c(0, 0)) +
+	scale_y_discrete(expand = c(0, 0))+
+  facet_grid(~active_site, scales = "free_x",space = "free_x",
+             labeller = labeller(active_site = label_wrap_gen(width = 10)))
+
+
+p_heatmap_conserv_AS<-p_heatmap_dist_activesite/p_effect_strip/p_divergence_strip+ plot_layout(heights = c(5,0.6, 0.6))
+
+```
+
+
+## Save
+
+```{r}
+ggsave(p_heatmap_conserv_AS,filename =paste0(output_dir_fig,"Fig3A_active_site_heatmap",format_img),height = 5,width = 15,limitsize = FALSE)
+```
+
+
+# ChimeraX
+
+## Cross-kinase divergence
+
+```{r}
+pos_global_pos_divergence<-unique(merge(all_active_site_data[,.(Pos_al,kinase,Pos)],global_pos_divergence, all.x=TRUE,by="Pos_al"))
+
+
+for (k in kinases) {
+  sig_residues <- pos_global_pos_divergence[kinase == k]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: ASconservation",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$pos_divergence)
+  )
+
+  file_name <- paste0(output_dir_chimera, "AS_conservation_", k, ".defattr")
+
+  writeLines(chimerax_lines, file_name)
+}
+```
+
+## Median effect across kinases
+
+```{r}
+pos_global_pos_effect<-unique(merge(all_active_site_data[,.(Pos_al,kinase,Pos)],global_pos_effect, all.x=TRUE, by=c("Pos_al","Pos")))
+
+
+for (k in kinases) {
+  sig_residues <- pos_global_pos_effect[kinase == k]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: ASeffect",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$pos_median_all)
+  )
+
+  file_name <- paste0(output_dir_chimera, "AS_avg_effect_", k, ".defattr")
+
+  writeLines(chimerax_lines, file_name)
+}
+```
+
+## Median effect per kinase
+
+```{r}
+pos_effect<-unique(all_active_site_data[,.(Pos_al,kinase,Pos,pos_median)])
+
+
+for (k in kinases) {
+  sig_residues <- pos_effect[kinase == k]
+
+  if (nrow(sig_residues) == 0) next
+
+  chimerax_lines <- c(
+    "attribute: ASeffect",
+    "recipient: residues",
+    paste0("\t:",sig_residues$Pos, "\t",sig_residues$pos_median)
+  )
+
+  file_name <- paste0(output_dir_chimera, "AS_avg_effect_each_", k, ".defattr")
+
+  writeLines(chimerax_lines, file_name)
+}
+```
+
+## Median ddGa per position
+
+```{r}
+ddg_median_a_unique <- unique(ddg_median_a[assay == "Activity", .(Pos, kinase, pos_median)])
+
+for (k in kinases) {
+  sig_residues <- ddg_median_a_unique[kinase == k]
+  if (nrow(sig_residues) == 0) next
+  writeLines(c(
+    "attribute: DDGmedian",
+    "recipient: residues",
+    paste0("\t:", sig_residues$Pos, "\t", sig_residues$pos_median)
+  ), paste0(output_dir_chimera, "DDGa_median_", k, ".defattr"))
+}
+```
+
+# Active-site enrichment
+
+```{r active_site_enrichment}
+as_positions <- unique(all_ddg_a[active_site != "", Pos_al])
+all_ddg_a[, in_AS := Pos_al %in% as_positions]
+
+as_enrich_one <- function(dt, cls) {
+  a <- nrow(dt[in_AS == TRUE  & class == cls])
+  b <- nrow(dt[in_AS == TRUE  & class != cls])
+  cc <- nrow(dt[in_AS == FALSE & class == cls])
+  d <- nrow(dt[in_AS == FALSE & class != cls])
+  ft   <- fisher.test(matrix(c(a, b, cc, d), nrow = 2))
+  or_h <- ((a + 0.5) * (d + 0.5)) / ((b + 0.5) * (cc + 0.5))
+  se   <- sqrt(1/(a + 0.5) + 1/(b + 0.5) + 1/(cc + 0.5) + 1/(d + 0.5))
+  data.table(n_class_AS = a, n_AS = a + b, n_class_total = a + cc,
+             OR = unname(ft$estimate), p = ft$p.value,
+             OR_plot = or_h,
+             ci_lo = exp(log(or_h) - 1.96 * se),
+             ci_hi = exp(log(or_h) + 1.96 * se))
+}
+
+as_enrich <- rbindlist(lapply(c("inactivating", "activating"), function(cls) {
+  per    <- rbindlist(lapply(kinases, function(k)
+              cbind(kinase = k, class = cls, as_enrich_one(all_ddg_a[kinase == k], cls))))
+  pooled <- cbind(kinase = "All", class = cls, as_enrich_one(all_ddg_a, cls))
+  rbind(per, pooled)
+}))
+as_enrich[, fdr := p.adjust(p, method = "fdr")]
+
+print(as_enrich[, .(kinase, class, n_class_AS, n_AS, n_class_total,
+                    OR = round(OR, 2), p = signif(p, 2), fdr = signif(fdr, 2))])
+```
+
+## Plot
+
+```{r active_site_enrichment_fig}
+pd <- copy(as_enrich)
+pd[, kinase := factor(kinase, levels = c(as.character(kinases), "All"))]
+pd[, class  := factor(class, levels = c("inactivating", "activating"))]
+
+pd[, log2_OR := log2(OR_plot)]
+pd[, sig := fcase(fdr < 1e-5, "***", fdr < 1e-3, "**", fdr < 0.1, "*", default = "")]
+pd[, star_y := ifelse(log2_OR >= 0, log2_OR + 0.25, log2_OR - 0.45)]
+
+dodge <- position_dodge(width = 0.7)
+p_as_enrich <- ggplot(pd, aes(x = kinase, y = log2_OR, fill = class)) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_col(position = dodge, width = 0.65, colour = "grey20", linewidth = 0.3) +
+  geom_text(aes(y = star_y, label = sig), position = dodge,
+            size = 5, vjust = 0.7, show.legend = FALSE) +
+  scale_fill_manual(values = c(inactivating = "brown3", activating = "blue3"),
+                    name = NULL) +
+  labs(x = NULL, y = "Enrichment in active site (Log2 OR)") +
+  scale_x_discrete(labels = relabel_jnk2) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        axis.text.x = element_text(color = "black"))
+ggsave(p_as_enrich,
+       filename = paste0(output_dir_figS5, "FigS5B_active_site_enrichment", format_img),
+       height = 3.3, width = 4.5, limitsize = FALSE)
+```
+
+# Activating mutations at adenosine-contact positions
+
+```{r adenosine_ring_perposition_or}
+aden_perpos_or <- rbindlist(lapply(aden_pos, function(pos) {
+  rbindlist(lapply(kinases, function(k) {
+    dt <- all_ddg_a[kinase == k & Pos_al %in% as_positions]
+    A <- nrow(dt[Pos_al == pos & class == "activating"])
+    B <- nrow(dt[Pos_al == pos & class != "activating"])
+    C <- nrow(dt[Pos_al != pos & class == "activating"])
+    D <- nrow(dt[Pos_al != pos & class != "activating"])
+    ft <- fisher.test(matrix(c(A, B, C, D), nrow = 2))
+    data.table(Pos_al = pos, kinase = k, WT_AA = dt[Pos_al == pos, WT_AA][1],
+               n_act = A, n = A + B, OR = unname(ft$estimate), p = ft$p.value)
+  }))
+}))
+aden_perpos_or[, kinase := factor(kinase, levels = kinases)]
+setorder(aden_perpos_or, Pos_al, kinase)
+print(aden_perpos_or[, .(Pos_al, kinase, WT_AA, n_act, n, OR = round(OR, 2), p = signif(p, 2))])
+```
+
